@@ -43,6 +43,8 @@ import mujoco
 import numpy as np
 import onnxruntime as ort
 
+from policies.keyboard import KeyboardPolicy
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
@@ -512,6 +514,12 @@ def main():
   parser = argparse.ArgumentParser(description="G1 Table Red Block — MuJoCo standalone")
   parser.add_argument("--no-cameras", action="store_true", help="Disable camera windows")
   parser.add_argument("--cam-fps", type=int, default=10, help="Camera render FPS (default: 10)")
+  parser.add_argument(
+    "--policy",
+    choices=["keyboard"],
+    default="keyboard",
+    help="Control policy to use (default: keyboard)",
+  )
   args = parser.parse_args()
 
   # Load config
@@ -553,6 +561,7 @@ def main():
   # Create controller
   ctrl = G1Controller(model, data, walker, croucher, rotator, config,
                       right_reacher=right_reacher)
+  policy = KeyboardPolicy(ctrl)
 
   # Warm up ONNX models (first call triggers JIT compilation)
   print("Warming up policies...")
@@ -613,7 +622,7 @@ def main():
     if keycode == 32:  # Space
       state["reset"] = True
     else:
-      ctrl.key_callback(keycode)
+      policy.handle_key(keycode)
 
   # ------------------------------------------------------------------- #
   # Simulation loop using launch_passive (MuJoCo's built-in viewer)
