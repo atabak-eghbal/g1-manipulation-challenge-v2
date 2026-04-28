@@ -510,6 +510,12 @@ def set_armature(model, joint_names):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def build_policy(name, controller):
+  if name == "keyboard":
+    return KeyboardPolicy(controller)
+  raise ValueError(f"Unsupported policy: {name}")
+
+
 def main():
   parser = argparse.ArgumentParser(description="G1 Table Red Block — MuJoCo standalone")
   parser.add_argument("--no-cameras", action="store_true", help="Disable camera windows")
@@ -561,7 +567,7 @@ def main():
   # Create controller
   ctrl = G1Controller(model, data, walker, croucher, rotator, config,
                       right_reacher=right_reacher)
-  policy = KeyboardPolicy(ctrl)
+  policy = build_policy(args.policy, ctrl)
 
   # Warm up ONNX models (first call triggers JIT compilation)
   print("Warming up policies...")
@@ -663,11 +669,6 @@ def main():
         target_pos = ctrl.default_joint_pos.copy()
         state["reset"] = False
         print("[RESET] Robot reset → WALK mode")
-
-      policy_output = policy.step()
-      ctrl.lin_vel_x, ctrl.lin_vel_y, ctrl.ang_vel_z = policy_output.walk_cmd
-      ctrl.reach_target[:] = policy_output.reach_target
-      ctrl.grip_closed = policy_output.grip_closed
 
       # Step physics in real time (cap catchup to avoid jitter snowball)
       wall = time.time() - t0
