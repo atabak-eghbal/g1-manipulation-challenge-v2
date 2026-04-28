@@ -22,7 +22,7 @@ class KeyboardPolicy(BasePolicy):
       self._controller.lin_vel_y,
       self._controller.ang_vel_z,
     )
-    reach_target = self._controller.reach_target
+    reach_target = tuple(self._controller.reach_target)
     return PolicyOutput(
       walk_cmd=walk_cmd,
       reach_target=reach_target,
