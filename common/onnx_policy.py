@@ -9,7 +9,10 @@ import onnxruntime as ort
 
 
 class ONNXPolicy:
-  """Thin CPU-only ONNX inference wrapper."""
+  """Thin CPU-only ONNX inference wrapper.
+
+  Expects a 1D or (1, N) float32 observation and returns the first output row.
+  """
 
   def __init__(self, model_path: str | Path):
     sess_options = ort.SessionOptions()

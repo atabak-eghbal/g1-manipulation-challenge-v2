@@ -32,12 +32,18 @@ def reset_robot(
   base_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
   reset_data: bool = True,
 ) -> None:
-  """Reset the robot to a deterministic pose and forward the model."""
+  """Reset the robot to a deterministic pose and forward the model.
+
+  joint_names should be the full ordered joint list from the config/model.
+  """
   if reset_data:
     mujoco.mj_resetData(model, data)
+  joint_names_list = list(joint_names)
+  joint_index = {name: idx for idx, name in enumerate(joint_names_list)}
   data.qpos[0:3] = base_pos
   data.qpos[3:7] = base_quat
   for name, value in config["default_joint_pos"].items():
-    if name in joint_names:
-      data.qpos[7 + joint_names.index(name)] = value
+    idx = joint_index.get(name)
+    if idx is not None:
+      data.qpos[7 + idx] = value
   mujoco.mj_forward(model, data)
