@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
-
 from .base import BasePolicy, PolicyOutput
 
 
@@ -19,12 +17,12 @@ class KeyboardPolicy(BasePolicy):
 
   def step(self) -> PolicyOutput:
     """Expose the controller's current high-level command state."""
-    walk_cmd = np.array([
+    walk_cmd = (
       self._controller.lin_vel_x,
       self._controller.lin_vel_y,
       self._controller.ang_vel_z,
-    ], dtype=np.float32)
-    reach_target = self._controller.reach_target.copy()
+    )
+    reach_target = self._controller.reach_target
     return PolicyOutput(
       walk_cmd=walk_cmd,
       reach_target=reach_target,
