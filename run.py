@@ -120,7 +120,7 @@ def main():
     print("  Right reacher loaded.")
 
   # Create controller
-  ctrl = WalkerReacherController(model, data, walker, config,
+  ctrl = WalkerReacherController(model, data, walker, croucher, rotator, config,
                                  right_reacher=right_reacher)
   policy = KeyboardPolicy(ctrl)
 

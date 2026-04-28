@@ -24,10 +24,13 @@ class WalkerReacherController:
 
   WALKER_HEIGHT = 0.80
 
-  def __init__(self, model, data, walker, config, right_reacher=None):
+  def __init__(self, model, data, walker, croucher, rotator, config,
+               right_reacher=None):
     self.model = model
     self.data = data
     self.walker_policy = walker
+    self.croucher_policy = croucher
+    self.rotator_policy = rotator
     self.right_reacher_policy = right_reacher
     self.config = config
 
