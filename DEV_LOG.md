@@ -51,3 +51,61 @@
 - **Extracted Files:** `common/onnx_policy.py` (CPU ONNX wrapper), `common/scene.py` (deterministic reset + camera renderer), `common/controller.py` (`WalkerReacherController`).
 - **Behavior Parity Checks:** Kept 200 Hz timestep with decimation=4; preserved warmup calls and keyboard control flow; reset state still zeros velocities and reach state .
 - **Controller Assumptions (ONNX Compatibility):** Walker obs ordering/scale matches config; default joint offsets from `model_config.json` stay unchanged; walker arm targets are zeroed before right-arm overlay; right-arm deltas are rate-limited; finger actuators remain written separately from body joints.
+
+## [2026-04-27] Step 4: Headless Smoke Test (scripts/smoke_env.py)
+- **Goal / Hypothesis:** Create a repeatable headless check that validates scene loading and ONNX warmup without the interactive viewer.
+- **Files Changed:** `scripts/smoke_env.py` (new), `DEV_LOG.md`.
+- **Commands Run:** `python scripts/smoke_env.py`
+- **Expected Result:** Script exits 0, prints pass/fail summary, confirms all FSM-required names.
+- **Actual Result:**
+  ```
+  --- Config ---
+    [PASS] model_config.json exists
+    [PASS] joint_names present  (29 joints)
+    [PASS] config['walker'] block
+    [PASS] config['croucher'] block
+
+  --- MuJoCo scene ---
+    [PASS] scene.xml exists
+    [PASS] scene loaded + forward pass
+
+  --- Cameras ---
+    [PASS] camera 'head_cam'  (id=3)
+    [PASS] camera 'wrist_cam'  (id=4)
+    [PASS] camera 'overhead'  (id=0)
+    [PASS] camera 'side_view'  (id=1)
+    [PASS] camera 'tracking'  (id=2)
+
+  --- Bodies ---
+    [PASS] body 'pelvis'  (id=1)
+    [PASS] body 'red_block'  (id=47)
+    [PASS] body 'table'  (id=45)
+    [PASS] body 'table_white'  (id=46)
+
+  --- Sites ---
+    [PASS] site 'right_palm'  (id=5)
+    [PASS] site 'imu_in_pelvis'  (id=0)
+    [PASS] site 'left_foot'  (id=1)
+    [PASS] site 'right_foot'  (id=2)
+
+  --- Config joints in model ---
+    [PASS] all 29 joints present
+
+  --- ONNX (required) ---
+    [PASS] walker.onnx exists
+    [PASS] walker warmup  (in=99 out=29)
+    [PASS] right_reacher.onnx exists
+    [PASS] right_reacher warmup  (in=36 out=7)
+
+  --- ONNX (optional) ---
+    [OK  ] croucher: in=101 out=29
+    [OK  ] rotator: in=99 out=29
+
+  ==================================================
+  RESULT: PASS  — repo is ready for FSM work
+  ==================================================
+  ```
+- **Pass / Fail:** Pass (exit 0).
+- **Missing names / files:** None. All required cameras, bodies, sites, joints, and ONNX files present. Both optional ONNX files (croucher, rotator) also present and warm.
+- **FSM readiness:** CONFIRMED. `right_palm` site (reacher positioning), `red_block` body (manipulation target), all 29 config joints, `head_cam`/`wrist_cam` cameras, and both required ONNX models are verified present and functional.
+- **Next Risk:** FSM state transitions and obs assembly correctness; walker obs vector ordering must be validated against the trained model's expected input layout before FSM integration.
