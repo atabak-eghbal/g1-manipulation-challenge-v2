@@ -40,3 +40,14 @@
 - **MuJoCo Warnings:** None (load did not start).
 - **Blockers:** N/A
 - **Next Risk:** N/A
+
+## [2026-04-28] Step 3: Extract ONNX Loading, Reset, Controller Core
+- **Goal / Hypothesis:** Extract low-level locomotion/reaching infrastructure into `common` without changing keyboard-driven behavior or control timing.
+- **Files Changed:** `common/onnx_policy.py`, `common/scene.py`, `common/controller.py`, `run.py`, `DEV_LOG.md`.
+- **Commands Run:** `python run.py --policy keyboard --no-cameras`
+- **Expected Result:** Manual controls behave identically, policies warm up, and reset uses deterministic helper.
+- **Actual Result:** `ModuleNotFoundError: No module named 'mujoco'` before scene load.
+- **Pass / Fail:** Fail (missing MuJoCo dependency in environment).
+- **Extracted Files:** `common/onnx_policy.py` (CPU ONNX wrapper), `common/scene.py` (deterministic reset + camera renderer), `common/controller.py` (`WalkerReacherController`).
+- **Behavior Parity Checks:** Kept 200 Hz timestep with decimation=4; preserved warmup calls and keyboard control flow; reset state still zeros velocities and reach state (code inspection due to missing MuJoCo).
+- **Controller Assumptions (ONNX Compatibility):** Walker obs ordering/scale matches config; default joint offsets from `model_config.json` stay unchanged; walker arm targets are zeroed before right-arm overlay; right-arm deltas are rate-limited; finger actuators remain written separately from body joints.
