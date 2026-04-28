@@ -27,7 +27,7 @@ class BasePolicy(ABC):
 
   def handle_key(self, keycode: int) -> None:
     """Optional keyboard hook for interactive policies."""
-    return None
+    pass
 
   @abstractmethod
   def step(self) -> PolicyOutput:
