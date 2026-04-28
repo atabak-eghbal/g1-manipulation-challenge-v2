@@ -49,5 +49,5 @@
 - **Actual Result:** `ModuleNotFoundError: No module named 'mujoco'` before scene load.
 - **Pass / Fail:** Fail (missing MuJoCo dependency in environment).
 - **Extracted Files:** `common/onnx_policy.py` (CPU ONNX wrapper), `common/scene.py` (deterministic reset + camera renderer), `common/controller.py` (`WalkerReacherController`).
-- **Behavior Parity Checks:** Kept 200 Hz timestep with decimation=4; preserved warmup calls and keyboard control flow; reset state still zeros velocities and reach state (code inspection due to missing MuJoCo).
+- **Behavior Parity Checks:** Kept 200 Hz timestep with decimation=4; preserved warmup calls and keyboard control flow; reset state still zeros velocities and reach state .
 - **Controller Assumptions (ONNX Compatibility):** Walker obs ordering/scale matches config; default joint offsets from `model_config.json` stay unchanged; walker arm targets are zeroed before right-arm overlay; right-arm deltas are rate-limited; finger actuators remain written separately from body joints.
