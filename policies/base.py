@@ -15,6 +15,7 @@ class PolicyOutput:
 
   walk_cmd: (lin_vel_x, lin_vel_y, ang_vel_z)
   reach_target: (x, y, z) target coordinates in pelvis frame
+  grip_closed: True when the right-hand grip should be closed
   """
 
   walk_cmd: WalkCommand

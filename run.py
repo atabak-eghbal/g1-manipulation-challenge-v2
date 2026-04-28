@@ -510,12 +510,6 @@ def set_armature(model, joint_names):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def build_policy(name, controller):
-  if name == "keyboard":
-    return KeyboardPolicy(controller)
-  raise ValueError(f"Unsupported policy: {name}")
-
-
 def main():
   parser = argparse.ArgumentParser(description="G1 Table Red Block — MuJoCo standalone")
   parser.add_argument("--no-cameras", action="store_true", help="Disable camera windows")
@@ -567,7 +561,7 @@ def main():
   # Create controller
   ctrl = G1Controller(model, data, walker, croucher, rotator, config,
                       right_reacher=right_reacher)
-  policy = build_policy(args.policy, ctrl)
+  policy = KeyboardPolicy(ctrl)
 
   # Warm up ONNX models (first call triggers JIT compilation)
   print("Warming up policies...")
