@@ -27,4 +27,5 @@ class KeyboardPolicy(BasePolicy):
       walk_cmd=walk_cmd,
       reach_target=reach_target,
       grip_closed=self._controller.grip_closed,
+      reach_active=self._controller.reach_active,
     )

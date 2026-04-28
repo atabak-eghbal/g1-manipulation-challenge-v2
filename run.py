@@ -43,6 +43,7 @@ import numpy as np
 from common.controller import WalkerReacherController
 from common.onnx_policy import ONNXPolicy
 from common.scene import CameraRenderer, reset_robot
+from policies.fsm import FSMPolicy
 from policies.keyboard import KeyboardPolicy
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -75,6 +76,17 @@ def set_armature(model, joint_names):
 
 
 # --------------------------------------------------------------------------- #
+# Policy helpers
+# --------------------------------------------------------------------------- #
+def _apply_policy_output(ctrl, out) -> None:
+  """Write a PolicyOutput into controller state before ctrl.step() runs."""
+  ctrl.lin_vel_x, ctrl.lin_vel_y, ctrl.ang_vel_z = out.walk_cmd
+  ctrl.reach_target[:] = out.reach_target
+  ctrl.reach_active    = out.reach_active
+  ctrl.grip_closed     = out.grip_closed
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -83,7 +95,7 @@ def main():
   parser.add_argument("--cam-fps", type=int, default=10, help="Camera render FPS (default: 10)")
   parser.add_argument(
     "--policy",
-    choices=["keyboard"],
+    choices=["keyboard", "fsm"],
     default="keyboard",
     help="Control policy to use (default: keyboard)",
   )
@@ -122,7 +134,13 @@ def main():
   # Create controller
   ctrl = WalkerReacherController(model, data, walker, croucher, rotator, config,
                                  right_reacher=right_reacher)
-  policy = KeyboardPolicy(ctrl)
+
+  if args.policy == "fsm":
+    policy = FSMPolicy(ctrl)
+    print("Policy: FSM (autonomous)")
+  else:
+    policy = KeyboardPolicy(ctrl)
+    print("Policy: keyboard (manual)")
 
   # Warm up ONNX models (first call triggers JIT compilation)
   print("Warming up policies...")
@@ -225,6 +243,7 @@ def main():
         sim_time = wall - max_catchup
       while sim_time < wall:
         if control_step % decimation == 0:
+          _apply_policy_output(ctrl, policy.step())
           target_pos = ctrl.step()
         ctrl.apply_pd_control(target_pos)
         mujoco.mj_step(model, data)

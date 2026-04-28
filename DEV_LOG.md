@@ -109,3 +109,41 @@
 - **Missing names / files:** None. All required cameras, bodies, sites, joints, and ONNX files present. Both optional ONNX files (croucher, rotator) also present and warm.
 - **FSM readiness:** CONFIRMED. `right_palm` site (reacher positioning), `red_block` body (manipulation target), all 29 config joints, `head_cam`/`wrist_cam` cameras, and both required ONNX models are verified present and functional.
 - **Next Risk:** FSM state transitions and obs assembly correctness; walker obs vector ordering must be validated against the trained model's expected input layout before FSM integration.
+
+## [2026-04-28] Step 5: FSM Scaffold (settle-only)
+- **Goal / Hypothesis:** Add the FSM plumbing (`SETTLE` → `DONE`) before adding any motion, so state transitions and logging can be verified independently.
+- **Files Changed:** `policies/base.py`, `policies/keyboard.py`, `policies/fsm_core.py` (new), `policies/fsm.py` (new), `run.py`, `DEV_LOG.md`.
+- **Commands Run:** `python run.py --policy fsm --no-cameras`
+- **Expected Result:** Robot holds pose, FSM logs `SETTLE → DONE` after ~3 s, no object motion, keyboard path unaffected.
+
+### FSM State Diagram (Step 5)
+```
+         ┌────────────────────────────────────────────┐
+         │  SETTLE (150 ticks ≈ 3 s)                  │
+         │  walk_cmd  = (0, 0, 0)                     │
+         │  reach_target = (0.3, -0.2, 0.2)  (carry) │
+         │  reach_active = False                      │
+         │  grip_closed  = False                      │
+         └────────────────┬───────────────────────────┘
+                          │ tick_state >= 150
+                          ▼
+         ┌────────────────────────────────────────────┐
+         │  DONE  (holds carry pose indefinitely)     │
+         └────────────────────────────────────────────┘
+
+  Future stubs (not yet wired):
+    DONE → APPROACH → GRASP → TRANSPORT → PLACE
+```
+
+### Log output
+```
+[FSM] init  state=SETTLE
+[FSM] SETTLE  waiting 150 ticks (~3 s)
+[FSM] SETTLE → DONE  (t=150)
+[FSM] DONE  task complete — holding position
+```
+
+- **Actual Result:** 300-tick headless simulation: FSM reaches DONE at t=150 exactly; `walk_cmd=(0,0,0)`, `reach_active=False`, `grip_closed=False` in both states. `PolicyOutput.reach_active` defaults to `False` (backward-compatible — existing keyboard tests unaffected).
+- **Pass / Fail:** Pass.
+- **Scaffold confirmed stable:** Yes. No motion, no regression to keyboard path, clean transition log. Safe to begin APPROACH logic in Step 6.
+- **Next Risk:** Computing approach walk_cmd from pelvis→red_block displacement requires verifying the pelvis-frame coordinate convention matches the walker's training frame.
