@@ -244,3 +244,103 @@ Robot walks from spawn to within arm reach in 85 control ticks (1.7 s simulation
 
 - **Pass / Fail:** **Pass.**
 - **Next Risk:** Step 7 — implement `DESCEND_SOURCE` + `CLOSE_GRIP` (arm descent to grasp height, finger close, kinematic attachment check).
+
+---
+
+## [2026-04-28] Step 7: Hover and Descend Toward Source
+
+- **Goal:** Controlled arm-only motion: pre-grasp hover above the cylinder, then descent to grasp height. No grip yet.
+- **Files Changed:** `policies/fsm_core.py`, `scripts/test_fsm_approach.py`.
+
+---
+
+### Decisions and Findings
+
+#### Decision 1 — Geometry helpers mirror the solution exactly
+
+Added four world-space helpers following the validated solution's conventions:
+
+| Helper | Returns |
+|--------|---------|
+| `_palm_world()` | `data.site_xpos[palm_id]` — live palm position |
+| `_table_surface_z()` | `geom_xpos[tbl_geom_id][2] + geom_size[tbl_geom_id][2]` — exact geom-based surface height |
+| `_source_hover_world()` | cylinder_xy + z = table_surface_z + 0.18 m |
+| `_source_grasp_world()` | cylinder_xy + z = table_surface_z + 0.06 m |
+
+Table geom name: `"table_top"` (geom ID 97). Using geom-based surface rather than body-centre + hardcoded offset — more accurate when body origin is not at the geom surface.
+
+#### Decision 2 — `_reach_from_world` with right_bias=-0.03
+
+```python
+def _reach_from_world(self, world_point, right_bias=-0.08):
+    pos, quat = self._pelvis_pose()
+    local = self._world_to_pelvis(pos, quat, world_point).copy()
+    local[1] = min(local[1], right_bias)       # cap y: stay right of centreline
+    return self._clip_reach_target(local)      # clip to reacher workspace
+```
+
+For source hover/grasp: `right_bias=-0.03` (table is roughly in front of robot, not far left). Source cylinder at pelvis-frame y ≈ 0.017–0.029, which would be clamped to y = -0.03 (keeping the reach target 3 cm to the right, inside the right arm's workspace).
+
+Reacher workspace bounds (from training spec): x ∈ [−0.30, 0.60], y ∈ [−0.60, 0.30], z ∈ [−0.40, 0.60].
+
+#### Decision 3 — Distance thresholds from the solution's validated values
+
+| Threshold | Value | Rationale |
+|-----------|-------|-----------|
+| `HOVER_SOURCE_THRESHOLD` | 0.14 m | Reacher accuracy floor is ~12 cm; need ≥ this |
+| `DESCEND_SOURCE_THRESHOLD` | 0.12 m | At the practical limit; relying on timeout fallback |
+| `DEBOUNCE_REACH` | 6 ticks | ~0.12 s; prevents single-step noise triggering transitions |
+
+#### Decision 4 — Timeouts as belt-and-suspenders
+
+HOVER_SOURCE_TIMEOUT=200 ticks (~4 s), DESCEND_SOURCE_TIMEOUT=300 ticks (~6 s). The reacher cannot always achieve the distance threshold — DESCEND especially hits the ~12 cm accuracy floor. The timeout ensures the FSM advances even when the exact threshold is never met.
+
+#### Decision 5 — Entry prints moved into `_transition()`
+
+Previously `if self._tick_state == 0:` never fired (tick is incremented after dispatch, so first real call has tick_state=1). Moved state-entry logging into `_transition()` itself where it reliably fires at the moment of state change.
+
+---
+
+### Observed geometry (from test run)
+
+```
+table_z                 = 0.7330 m   (top surface of source table)
+hover_world.z           = 0.9130 m   (table_z + 0.18)
+grasp_world.z           = 0.7930 m   (table_z + 0.06)
+cylinder_world.z        = 0.7680 m   (cylinder body origin, ~3.5 cm above surface)
+
+HOVER_SOURCE entry palm_dist  = 0.256 m   (arm still in carry pose)
+HOVER_SOURCE exit  palm_dist  = 0.127 m   (threshold met: 0.127 < 0.14)
+DESCEND_SOURCE entry palm_dist = 0.134 m
+DESCEND_SOURCE exit  palm_dist = 0.123 m  (timeout — reacher accuracy floor)
+
+CLOSE_GRIP palm_to_cyl = 0.128 m     (within ~13 cm kinematic attachment range)
+```
+
+**Table clearance:** hover is 18 cm above table; palm descends to ~8 cm above table at CLOSE_GRIP. No collision risk.
+
+**Reacher accuracy floor:** DESCEND_SOURCE exits via timeout (300 ticks = 6 s) with palm_dist=0.123 m — just above the 0.12 m threshold. This matches the solution's documented ~12 cm floor. The kinematic attachment in Step 8 fires at 13 cm, so this distance is within the attachment window.
+
+---
+
+### FSM sequence (full)
+
+```
+SETTLE (150 ticks)
+  → APPROACH_SOURCE: walk → cyl in reach window
+  → HOVER_SOURCE: arm rises to hover above cyl (table_z + 0.18)
+  → DESCEND_SOURCE: arm descends to grasp height (table_z + 0.06)
+  → CLOSE_GRIP: hold — grip pending Step 8
+```
+
+### Test result
+
+```
+PASS — reached CLOSE_GRIP at control tick 562
+  palm_world : (-0.056, -0.083, 0.807)
+  cyl_world  : (0.000, 0.026, 0.768)
+  palm-to-cyl dist : 0.128 m
+```
+
+- **Pass / Fail:** **Pass.**
+- **Next Risk:** Step 8 — close grip + kinematic attachment (attach when palm within 13 cm, clamp in-hand offset to ~3 cm so cylinder doesn't appear to float, then lift to carry pose).

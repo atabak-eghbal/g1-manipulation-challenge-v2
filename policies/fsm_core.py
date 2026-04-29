@@ -20,32 +20,37 @@ CARRY_POSE: tuple[float, float, float] = (0.3, -0.2, 0.2)
 SETTLE_TICKS = 150
 
 # ---- Approach: staircase forward speeds ----
-# Target x=0.34 m (within arm reach). Steps slow the robot down as it closes
-# in so it doesn't overshoot the reachability window.
-APPROACH_TARGET_X = 0.34   # m forward — cylinder centre-of-gravity at reach
+APPROACH_TARGET_X = 0.34   # m forward — cylinder at reach when this close
 
-# ---- Reachability window for APPROACH → HOVER transition ----
-# Validated window from reference solution. y target is -0.05 (right-of-centre
-# for the right arm). Window is intentionally narrow so we only transition when
-# genuinely in reach.
-REACH_X_MIN, REACH_X_MAX = 0.20, 0.38
-REACH_Y_MIN, REACH_Y_MAX = -0.14, 0.02
+REACH_X_MIN, REACH_X_MAX = 0.20, 0.38   # x reachability window
+REACH_Y_MIN, REACH_Y_MAX = -0.14, 0.02  # y reachability window
 
-# Consecutive in-window ticks before transition fires (~0.16 s at 50 Hz).
-REACH_DEBOUNCE = 8
+REACH_DEBOUNCE = 8   # consecutive in-window ticks before APPROACH → HOVER
 
-# ---- Staircase forward speeds (m/s) — see _approach_walk_cmd ----
-VX_FAST   = 0.35   # x_err > 0.18 m
-VX_MED    = 0.22   # x_err > 0.10 m
-VX_SLOW   = 0.12   # x_err > 0.04 m
+VX_FAST, VX_MED, VX_SLOW = 0.35, 0.22, 0.12   # staircase vx (m/s)
+K_VY,  VY_CAP  = 1.8, 0.18   # vy: proportional toward y = -0.05
+K_WZ,  WZ_CAP  = 1.2, 0.25   # wz: arctan2-based yaw
 
-# ---- Lateral (vy) proportional gain toward y = -0.05 ----
-K_VY      = 1.8
-VY_CAP    = 0.18
+# ---- Hover and grasp heights above table surface ----
+HOVER_SOURCE_HEIGHT = 0.18   # m: pre-grasp hover above table top
+GRASP_HEIGHT        = 0.06   # m: cylinder mid-body height above table top
 
-# ---- Yaw: arctan2-based, pointing toward cylinder ----
-K_WZ      = 1.2
-WZ_CAP    = 0.25
+# ---- Palm-to-target distance thresholds ----
+# The reacher has an ~12 cm accuracy floor; thresholds must stay ≥ this.
+HOVER_SOURCE_THRESHOLD   = 0.14   # m
+DESCEND_SOURCE_THRESHOLD = 0.12   # m
+
+# ---- Per-state timeouts (control ticks at 50 Hz) ----
+HOVER_SOURCE_TIMEOUT   = 200   # ~4 s fallback if threshold never met
+DESCEND_SOURCE_TIMEOUT = 300   # ~6 s fallback
+
+# ---- General reach-state debounce ----
+DEBOUNCE_REACH = 6   # consecutive ticks palm must be within threshold
+
+# ---- Reacher workspace bounds in pelvis frame ----
+# From the training spec; targets outside are clamped before being sent.
+_REACH_LOW  = np.array([-0.30, -0.60, -0.40], dtype=np.float32)
+_REACH_HIGH = np.array([ 0.60,  0.30,  0.60], dtype=np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -56,9 +61,8 @@ class FSMState(Enum):
     SETTLE          = auto()
     APPROACH_SOURCE = auto()
     HOVER_SOURCE    = auto()
-    GRASP           = auto()   # stub
-    TRANSPORT       = auto()   # stub
-    PLACE           = auto()   # stub
+    DESCEND_SOURCE  = auto()
+    CLOSE_GRIP      = auto()   # Step 8: grip + kinematic attachment
     DONE            = auto()
 
 
@@ -69,56 +73,73 @@ class FSMState(Enum):
 class FSMCore:
     """Tick-driven state machine that emits a high-level PolicyOutput each step.
 
-    Requires access to ``model`` and ``data`` for GT geometry queries; these
-    are passed at construction time and never modified here.
+    Holds references to MuJoCo model/data for GT geometry; never modifies them.
     """
 
     def __init__(self, model, data) -> None:
         self._model = model
         self._data  = data
 
-        # Cache MuJoCo body IDs used every tick.
-        self._rb_id  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "red_block")
-        self._tbl_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
+        # ---- MuJoCo ID cache ----
+        self._rb_id       = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "red_block")
+        self._tbl_id      = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
+        self._palm_id     = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "right_palm")
+        # Geom-based table surface is more accurate than body-centre + offset.
+        self._tbl_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
 
         self.state        = FSMState.SETTLE
         self._tick_total  = 0
         self._tick_state  = 0
-        self._reach_count = 0   # debounce counter for APPROACH → HOVER
+        self._reach_count = 0   # general-purpose debounce counter
 
-        print(f"[FSM] init  state={self.state.name}  "
-              f"red_block_id={self._rb_id}  table_id={self._tbl_id}")
+        print(
+            f"[FSM] init  state={self.state.name}"
+            f"  rb={self._rb_id}  tbl={self._tbl_id}"
+            f"  palm={self._palm_id}  tbl_geom={self._tbl_geom_id}"
+        )
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
 
     def tick(self) -> PolicyOutput:
-        """Advance the FSM one control step and return the current command."""
         out = self._dispatch()
         self._tick_total += 1
         self._tick_state += 1
         return out
 
     # ------------------------------------------------------------------ #
-    # Dispatch and transition helper
+    # Dispatch + transition
     # ------------------------------------------------------------------ #
 
     def _dispatch(self) -> PolicyOutput:
-        if self.state == FSMState.SETTLE:
-            return self._settle()
-        if self.state == FSMState.APPROACH_SOURCE:
-            return self._approach_source()
-        if self.state == FSMState.HOVER_SOURCE:
-            return self._hover_source()
-        if self.state == FSMState.DONE:
-            return self._done()
-        return self._settle()   # unreachable guard
+        if self.state == FSMState.SETTLE:          return self._settle()
+        if self.state == FSMState.APPROACH_SOURCE: return self._approach_source()
+        if self.state == FSMState.HOVER_SOURCE:    return self._hover_source()
+        if self.state == FSMState.DESCEND_SOURCE:  return self._descend_source()
+        if self.state == FSMState.CLOSE_GRIP:      return self._close_grip()
+        return self._done()
 
     def _transition(self, new: FSMState) -> None:
         print(f"[FSM] {self.state.name} → {new.name}  (t={self._tick_total})")
-        self.state       = new
-        self._tick_state = 0
+        # Log world geometry at the moment of entry so the log is self-contained.
+        if new == FSMState.HOVER_SOURCE:
+            hover = self._source_hover_world()
+            tbl_z = self._table_surface_z()
+            dist  = float(np.linalg.norm(self._palm_world() - hover))
+            print(f"[FSM]   hover_world=({hover[0]:.3f},{hover[1]:.3f},{hover[2]:.3f})"
+                  f"  table_z={tbl_z:.4f}  entry_palm_dist={dist:.3f}")
+        elif new == FSMState.DESCEND_SOURCE:
+            grasp = self._source_grasp_world()
+            dist  = float(np.linalg.norm(self._palm_world() - grasp))
+            print(f"[FSM]   grasp_world=({grasp[0]:.3f},{grasp[1]:.3f},{grasp[2]:.3f})"
+                  f"  entry_palm_dist={dist:.3f}")
+        elif new == FSMState.CLOSE_GRIP:
+            dist = float(np.linalg.norm(self._palm_world() - self._cylinder_world()))
+            print(f"[FSM]   palm_to_cyl={dist:.3f} m  (grip pending Step 8)")
+        self.state        = new
+        self._tick_state  = 0
+        self._reach_count = 0   # reset debounce for the new state
 
     # ------------------------------------------------------------------ #
     # State handlers
@@ -140,21 +161,17 @@ class FSMCore:
     def _approach_source(self) -> PolicyOutput:
         if self._tick_state == 0:
             print("[FSM] APPROACH_SOURCE  walking toward red cylinder")
-
         cyl = self._cylinder_in_pelvis()
-
         if self._in_reach_window(cyl):
             self._reach_count += 1
             walk_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         else:
             self._reach_count = 0
             walk_cmd = self._approach_walk_cmd(cyl)
-
         if self._reach_count >= REACH_DEBOUNCE:
-            cyl_str = f"({cyl[0]:.3f}, {cyl[1]:.3f}, {cyl[2]:.3f})"
-            print(f"[FSM] cylinder in reach window: pelvis_frame={cyl_str}")
+            print(f"[FSM] cylinder in reach window: "
+                  f"pelvis_frame=({cyl[0]:.3f},{cyl[1]:.3f},{cyl[2]:.3f})")
             self._transition(FSMState.HOVER_SOURCE)
-
         return PolicyOutput(
             walk_cmd=walk_cmd,
             reach_target=CARRY_POSE,
@@ -163,19 +180,63 @@ class FSMCore:
         )
 
     def _hover_source(self) -> PolicyOutput:
-        if self._tick_state == 0:
-            cyl   = self._cylinder_in_pelvis()
-            tbl_z = self._table_surface_z()
-            print(
-                f"[FSM] HOVER_SOURCE  "
-                f"cyl_pelvis=({cyl[0]:.3f},{cyl[1]:.3f},{cyl[2]:.3f})"
-                f"  table_surface_z={tbl_z:.4f}"
-                f"  (arm descent in next step)"
-            )
+        hover = self._source_hover_world()
+        reach = self._reach_from_world(hover, right_bias=-0.03)
+        palm  = self._palm_world()
+        dist  = float(np.linalg.norm(palm - hover))
+
+        if dist < HOVER_SOURCE_THRESHOLD:
+            self._reach_count += 1
+        else:
+            self._reach_count = 0
+
+        if self._reach_count >= DEBOUNCE_REACH:
+            print(f"[FSM] HOVER_SOURCE → threshold met  palm_dist={dist:.3f}")
+            self._transition(FSMState.DESCEND_SOURCE)
+        elif self._tick_state >= HOVER_SOURCE_TIMEOUT:
+            print(f"[FSM] HOVER_SOURCE → timeout  palm_dist={dist:.3f}")
+            self._transition(FSMState.DESCEND_SOURCE)
+
         return PolicyOutput(
             walk_cmd=(0.0, 0.0, 0.0),
-            reach_target=CARRY_POSE,
-            reach_active=False,
+            reach_target=reach,
+            reach_active=True,
+            grip_closed=False,
+        )
+
+    def _descend_source(self) -> PolicyOutput:
+        grasp = self._source_grasp_world()
+        reach = self._reach_from_world(grasp, right_bias=-0.03)
+        palm  = self._palm_world()
+        dist  = float(np.linalg.norm(palm - grasp))
+
+        if dist < DESCEND_SOURCE_THRESHOLD:
+            self._reach_count += 1
+        else:
+            self._reach_count = 0
+
+        if self._reach_count >= DEBOUNCE_REACH:
+            print(f"[FSM] DESCEND_SOURCE → threshold met  palm_dist={dist:.3f}")
+            self._transition(FSMState.CLOSE_GRIP)
+        elif self._tick_state >= DESCEND_SOURCE_TIMEOUT:
+            print(f"[FSM] DESCEND_SOURCE → timeout  palm_dist={dist:.3f}")
+            self._transition(FSMState.CLOSE_GRIP)
+
+        return PolicyOutput(
+            walk_cmd=(0.0, 0.0, 0.0),
+            reach_target=reach,
+            reach_active=True,
+            grip_closed=False,
+        )
+
+    def _close_grip(self) -> PolicyOutput:
+        """Step 8 stub: hold grasp pose, grip not yet commanded."""
+        grasp = self._source_grasp_world()
+        reach = self._reach_from_world(grasp, right_bias=-0.03)
+        return PolicyOutput(
+            walk_cmd=(0.0, 0.0, 0.0),
+            reach_target=reach,
+            reach_active=True,
             grip_closed=False,
         )
 
@@ -194,7 +255,6 @@ class FSMCore:
     # ------------------------------------------------------------------ #
 
     def _pelvis_pose(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (position, quaternion) of the pelvis in world frame."""
         return self._data.qpos[:3].copy(), self._data.qpos[3:7].copy()
 
     @staticmethod
@@ -203,11 +263,7 @@ class FSMCore:
         pelvis_quat: np.ndarray,
         vec_world: np.ndarray,
     ) -> np.ndarray:
-        """Express a world-frame point in the pelvis body frame.
-
-        Implements the passive rotation  q^{-1} * (v - p)  via the
-        Rodrigues-style formula used throughout the controller.
-        """
+        """Rotate world-frame point into pelvis frame: q⁻¹(v − p)."""
         v   = vec_world - pelvis_pos
         w   = pelvis_quat[0]
         xyz = pelvis_quat[1:4]
@@ -215,31 +271,66 @@ class FSMCore:
         return v - w * t + np.cross(xyz, t)
 
     def _cylinder_world(self) -> np.ndarray:
-        """World position of the red-block body origin (live from MuJoCo)."""
         return self._data.xpos[self._rb_id].copy()
 
     def _cylinder_in_pelvis(self) -> np.ndarray:
-        """Cylinder position expressed in the pelvis body frame."""
         pos, quat = self._pelvis_pose()
         return self._world_to_pelvis(pos, quat, self._cylinder_world())
 
+    def _palm_world(self) -> np.ndarray:
+        return self._data.site_xpos[self._palm_id].copy()
+
     def _table_surface_z(self) -> float:
-        """World Z of the source table's top surface (live body position + half-height)."""
-        body_z = float(self._data.xpos[self._tbl_id][2])
-        # table_top geom is a box with half-size Z = 0.02 m.
-        return body_z + 0.02
+        """World Z of the source table's top surface.
+
+        Uses geom_xpos + geom half-height when the geom ID is available
+        (more accurate than body centre + hardcoded offset).
+        Falls back to body approach if geom lookup failed.
+        """
+        if self._tbl_geom_id >= 0:
+            return float(
+                self._data.geom_xpos[self._tbl_geom_id][2]
+                + self._model.geom_size[self._tbl_geom_id][2]
+            )
+        return float(self._data.xpos[self._tbl_id][2]) + 0.02
+
+    def _source_hover_world(self) -> np.ndarray:
+        """World point above the cylinder for pre-grasp hover."""
+        p = self._cylinder_world().copy()
+        p[2] = self._table_surface_z() + HOVER_SOURCE_HEIGHT
+        return p
+
+    def _source_grasp_world(self) -> np.ndarray:
+        """World point at cylinder mid-body height for grasping."""
+        p = self._cylinder_world().copy()
+        p[2] = self._table_surface_z() + GRASP_HEIGHT
+        return p
+
+    @staticmethod
+    def _clip_reach_target(reach: np.ndarray) -> np.ndarray:
+        """Clip a pelvis-frame reach target to the reacher's workspace."""
+        return np.clip(reach, _REACH_LOW, _REACH_HIGH).astype(np.float32)
+
+    def _reach_from_world(
+        self, world_point: np.ndarray, right_bias: float = -0.08
+    ) -> np.ndarray:
+        """Convert world point → clipped pelvis-frame reach target.
+
+        right_bias clamps y so the target is at least this far to the
+        robot's right (y ≤ right_bias in pelvis frame), keeping the reach
+        target inside the right arm's natural workspace.
+        """
+        pos, quat = self._pelvis_pose()
+        local = self._world_to_pelvis(pos, quat, world_point).copy().astype(np.float32)
+        local[1] = min(float(local[1]), right_bias)
+        return self._clip_reach_target(local)
 
     # ------------------------------------------------------------------ #
     # Approach commander
     # ------------------------------------------------------------------ #
 
     def _approach_walk_cmd(self, cyl: np.ndarray) -> tuple[float, float, float]:
-        """Staircase walk command: forward speed based on x-distance, plus vy/yaw.
-
-        vx  — stepped (fast/med/slow/stop) as x_err closes.
-        vy  — proportional toward y = -0.05 (right-arm sweet spot).
-        wz  — arctan2-based yaw to face cylinder, bounded.
-        """
+        """Staircase vx + proportional vy/wz toward cylinder."""
         x_err = cyl[0] - APPROACH_TARGET_X
         if x_err > 0.18:
             vx = VX_FAST
@@ -249,10 +340,8 @@ class FSMCore:
             vx = VX_SLOW
         else:
             vx = 0.0
-
         y_err = cyl[1] - (-0.05)
         vy = float(np.clip(K_VY * y_err, -VY_CAP, VY_CAP))
-
         wz = float(np.clip(
             K_WZ * np.arctan2(cyl[1], max(cyl[0], 0.15)),
             -WZ_CAP, WZ_CAP,
@@ -260,19 +349,5 @@ class FSMCore:
         return (vx, vy, wz)
 
     def _in_reach_window(self, cyl: np.ndarray) -> bool:
-        """True when the cylinder is inside the 2-D reachability box (x, y only)."""
         return (REACH_X_MIN < cyl[0] < REACH_X_MAX and
                 REACH_Y_MIN < cyl[1] < REACH_Y_MAX)
-
-    # ------------------------------------------------------------------ #
-    # Stubs for future phases
-    # ------------------------------------------------------------------ #
-
-    def _grasp_reach_target(self) -> tuple[float, float, float]:
-        """Right-arm reach target in pelvis frame for grasp pose (Step 7)."""
-        raise NotImplementedError("_grasp_reach_target: implement in Step 7")
-
-    def _target_pos(self) -> np.ndarray:
-        """World position of the drop zone / white table (Step 8)."""
-        bid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, "table_white")
-        return self._data.xpos[bid].copy()
