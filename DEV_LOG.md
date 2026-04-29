@@ -147,3 +147,100 @@
 - **Pass / Fail:** Pass.
 - **Scaffold confirmed stable:** Yes. No motion, no regression to keyboard path, clean transition log. Safe to begin APPROACH logic in Step 6.
 - **Next Risk:** Computing approach walk_cmd from pelvis→red_block displacement requires verifying the pelvis-frame coordinate convention matches the walker's training frame.
+
+---
+
+## [2026-04-28] Step 6: GT Object Lookup + Source Approach (SETTLE → APPROACH_SOURCE → HOVER_SOURCE)
+
+- **Goal:** Walk the robot to the red cylinder and transition to HOVER_SOURCE once within arm reach.
+- **Files Changed:** `policies/fsm_core.py`, `policies/fsm.py`, `common/controller.py`, `scripts/test_fsm_approach.py` (new).
+
+---
+
+### Decisions and Findings
+
+#### Decision 1 — Walker ONNX takes raw observations (no external normalization)
+
+**Hypothesis from previous session:** walker ONNX needs `(obs − mean) / std` applied externally because without it the robot barely moves.
+
+**Disproof:** Comparing MD5 of `walker.onnx` between this repo and the working solution repo — they are **identical**. The solution's controller passes **raw** observations to the walker. Probing the ONNX directly confirmed:
+
+```
+raw zeros           → action max=0.628   (reasonable)
+normalized zeros    → action max=14.78   (catastrophically large)
+raw stand+vx=0.35   → action max=0.598   (reasonable)
+norm stand+vx=0.35  → action max=1.923   (3× too large → fall)
+```
+
+**Root cause of fall:** External `(obs − mean) / std` was **double-normalizing** — the ONNX bakes in its own normalization internally. Applying it externally amplified all obs by ~3×, producing joint deltas large enough to knock the robot over in ~0.4 s.
+
+**Fix:** Removed `_walker_obs_mean`, `_walker_obs_std` from `controller.__init__()` and removed the `obs_norm` line in `controller.step()`. Walker now receives raw obs.
+
+**Also reverted:** The `last_action = self._walker_obs_mean[67:96].copy()` seeding fix from the previous session — this was based on the wrong premise. Reverted to `last_action = np.zeros(29)`.
+
+---
+
+#### Decision 2 — Reacher must run unconditionally (not gated on reach_active)
+
+**Symptom:** Even with raw obs, robot moved only 0.07 m in 11 s (commanded at 0.35 m/s). No fall, just very slow progress.
+
+**Root cause:** Our `controller.step()` only called the right-arm reacher when `reach_active=True`. During SETTLE and APPROACH (where `reach_active=False`), the right arm sat at its default pose (arms-at-sides). The **walker ONNX sees arm joint positions as part of obs[9:38]** — when trained with carry-pose arms and tested with default-pose arms, the obs distribution mismatch caused the walker to produce weak locomotion actions.
+
+**Comparison with solution:** The solution's `WalkerReacherController.step()` **always** calls the reacher unconditionally. The FSM always sets `reach_target = CARRY_TARGET = (0.22, −0.24, 0.38)` during SETTLE and APPROACH, so the right arm is actively commanded to carry pose throughout walking.
+
+**Fix:** Removed the `if self.reach_active` guard. The reacher now runs every tick, writing the right-arm columns regardless of `reach_active`. Also removed the `frozen_arm_pos` logic (solution doesn't have it; carry pose is the natural idle for the arm).
+
+---
+
+#### Decision 3 — Approach command: staircase speeds + vy strafe
+
+**Previous approach:** Proportional `vx = K_VX × dx` (K_VX=2.5) with strafe disabled (K_VY=0) and gentle yaw only (K_WZ=0.15). Worked for standing/balance but was never tested with walking.
+
+**New approach (from validated solution):**
+
+```python
+x_err = cyl[0] - 0.34
+if x_err > 0.18:  vx = 0.35
+elif x_err > 0.10: vx = 0.22
+elif x_err > 0.04: vx = 0.12
+else:              vx = 0.0
+
+y_err = cyl[1] - (-0.05)              # target y = −0.05 (right-arm sweet spot)
+vy  = clip(1.8 × y_err, −0.18, 0.18)
+wz  = clip(1.2 × arctan2(cyl_y, max(cyl_x, 0.15)), −0.25, 0.25)
+```
+
+**Why staircase:** Proportional control overshoots the window at low x_err. The staircase steps smoothly to zero speed as the cylinder enters range.
+
+**Why vy enabled:** Previous concern was coupled strafe+yaw oscillation. This does not occur when yaw is arctan2-based (naturally bounded) rather than proportional to a running error.
+
+---
+
+#### Decision 4 — Reach window tightened to solution-validated values
+
+| Parameter | Old | New |
+|-----------|-----|-----|
+| REACH_X range | 0.28–0.52 m | 0.20–0.38 m |
+| REACH_Y range | −0.45–0.12 m | −0.14–0.02 m |
+| APPROACH_TARGET_X | 0.40 m | 0.34 m |
+| REACH_DEBOUNCE | 10 ticks | 8 ticks |
+
+Old window was oversized (especially Y), causing the debounce counter to fire before the arm was truly in range.
+
+---
+
+### Final test result
+
+```
+[FSM] SETTLE → APPROACH_SOURCE  (t=150)
+[FSM] cylinder in reach window: pelvis_frame=(0.363, 0.017, 0.038)
+[FSM] APPROACH_SOURCE → HOVER_SOURCE  (t=234)
+
+PASS — reached HOVER_SOURCE at control tick 235
+  cyl pelvis: x=0.362  y=0.020  z=0.037
+```
+
+Robot walks from spawn to within arm reach in 85 control ticks (1.7 s simulation) after settling.
+
+- **Pass / Fail:** **Pass.**
+- **Next Risk:** Step 7 — implement `DESCEND_SOURCE` + `CLOSE_GRIP` (arm descent to grasp height, finger close, kinematic attachment check).

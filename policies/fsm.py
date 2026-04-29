@@ -15,7 +15,7 @@ class FSMPolicy(BasePolicy):
 
     def __init__(self, controller) -> None:
         self._ctrl = controller
-        self._fsm  = FSMCore()
+        self._fsm  = FSMCore(controller.model, controller.data)
 
     def step(self) -> PolicyOutput:
         out = self._fsm.tick()

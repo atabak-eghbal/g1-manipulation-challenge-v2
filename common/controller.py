@@ -55,8 +55,6 @@ class WalkerReacherController:
     self.last_arm_action = np.zeros(7, dtype=np.float32)
     self.last_arm_target = None
     self.arm_max_delta = 0.012
-    # Frozen arm position — holds the last reach position when switching to walk
-    self.frozen_arm_pos = None  # None = use defaults, array = hold position
 
     self.last_action = np.zeros(29, dtype=np.float32)
 
@@ -322,21 +320,21 @@ class WalkerReacherController:
       lin_vel, ang_vel, proj_gravity, joint_pos, joint_vel, self.last_action, cmd,
     ]).astype(np.float32)
 
-    # Walker policy (handles legs, waist, standing, walking, turning)
+    # Walker policy (handles legs, waist, standing, walking, turning).
+    # The ONNX bakes in its own obs normalisation — pass raw obs directly.
     action = self.walker_policy(obs)
     target_pos = self.default_joint_pos + action * self.action_scales
 
-    # Arms: left arm always at default, right arm holds last reach position
+    # Zero walker arm outputs — reacher writes these columns.
+    # Left arm: always at default (no left-arm reacher).
     for idx in self.arm_indices:
       target_pos[idx] = self.default_joint_pos[idx]
 
-    # Right arm: if we have a frozen position from a previous reach, hold it
-    if not self.reach_active and self.frozen_arm_pos is not None:
-      for i, full_idx in enumerate(self.right_arm_indices):
-        target_pos[full_idx] = self.frozen_arm_pos[i]
-
-    # Right arm reacher overlay (when in reach mode)
-    if self.reach_active and self.right_reacher_policy is not None:
+    # Reacher always runs so the right arm is actively controlled (carry
+    # pose during walking, reach pose during grasping). This matches the
+    # solution's architecture: the arm must be in a known pose so the
+    # walker's joint-position obs match the trained distribution.
+    if self.right_reacher_policy is not None:
       reacher_obs = np.concatenate([
         self.reach_target,
         self.reach_orientation,
