@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from .base import BasePolicy, PolicyOutput
-from .fsm_core import FSMCore
+from .fsm_core import FSMCore, FSMState
+
+# States where grip_closed=False is intentional — do not override.
+_RELEASE_STATES = frozenset({FSMState.OPEN_GRIP, FSMState.RETRACT, FSMState.DONE})
 
 
 class FSMPolicy(BasePolicy):
@@ -33,13 +36,16 @@ class FSMPolicy(BasePolicy):
         return out
 
     def _close_grip_command(self, out: PolicyOutput) -> PolicyOutput:
-        """Keep grip closed if the grasp backend is currently holding the object.
+        """Keep grip closed while carrying — but not during intentional release.
 
-        The FSM may command grip_closed=False in DONE state when not attached.
-        This guard ensures the grip stays closed for the full duration of the
-        carry, even across FSM state transitions.
+        Prevents a single-tick grip opening caused by FSM state-transition timing
+        from accidentally dropping the cylinder mid-carry.  The guard is bypassed
+        in OPEN_GRIP / RETRACT / DONE so the FSM can actually release the object.
         """
-        if self._grasp is not None and self._grasp.attached and not out.grip_closed:
+        if (self._grasp is not None
+                and self._grasp.attached
+                and not out.grip_closed
+                and self._fsm.state not in _RELEASE_STATES):
             return PolicyOutput(
                 walk_cmd=out.walk_cmd,
                 reach_target=out.reach_target,

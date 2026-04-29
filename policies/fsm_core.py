@@ -59,6 +59,20 @@ TARGET_NEAR_EDGE_INSET  = 0.05   # m inward from near edge
 TARGET_REACH_DEBOUNCE   = 8      # consecutive in-window ticks → HOVER_TARGET
 TARGET_APPROACH_TIMEOUT = 900    # ~18 s fallback (large turn required from source side)
 
+# ---- Target table placement ----
+HOVER_TARGET_HEIGHT    = 0.18   # m above target surface for pre-place hover
+PLACE_HEIGHT           = 0.06   # m above target surface for release
+HOVER_TARGET_THRESHOLD = 0.14   # m palm-to-hover-point (same floor as source)
+LOWER_TARGET_THRESHOLD = 0.14   # m palm-to-place-point
+HOVER_TARGET_TIMEOUT   = 200    # ~4 s
+LOWER_TARGET_TIMEOUT   = 300    # ~6 s
+OPEN_GRIP_TIMEOUT      = 100    # ~2 s: wait for kinematic release
+RETRACT_TIMEOUT        = 200    # ~4 s: arm clear of target table
+
+# Table-membership margins for _cylinder_on_target_table().
+ON_TABLE_XY_MARGIN = 0.05   # m: allow up to 5 cm outside geom footprint
+ON_TABLE_Z_MAX     = 0.20   # m above surface: cap for height sanity check
+
 # Phase 1 of target approach: turn CW to face -y before driving toward standing waypoint.
 # Use VX_SLOW so the walker actually responds to the command (vx=0.06 is below effective
 # minimum, giving near-zero turn rate).  WZ_P1 = 1.0 (vel_max_angular) creates a tight
@@ -85,7 +99,10 @@ class FSMState(Enum):
     CLOSE_GRIP      = auto()   # close fingers; wait for backend to confirm attach
     LIFT_SOURCE     = auto()   # raise arm to carry pose; confirm cylinder left table
     APPROACH_TARGET = auto()   # walk/turn toward target-table placement corridor
-    HOVER_TARGET    = auto()   # Step 10 stub: hold in corridor, don't place yet
+    HOVER_TARGET    = auto()   # move arm above drop point, stop walking
+    LOWER_TARGET    = auto()   # descend arm to release height
+    OPEN_GRIP       = auto()   # open fingers; wait for kinematic detach
+    RETRACT         = auto()   # raise arm to carry pose
     DONE            = auto()
 
 
@@ -155,6 +172,9 @@ class FSMCore:
         if self.state == FSMState.LIFT_SOURCE:     return self._lift_source()
         if self.state == FSMState.APPROACH_TARGET: return self._approach_target()
         if self.state == FSMState.HOVER_TARGET:    return self._hover_target()
+        if self.state == FSMState.LOWER_TARGET:    return self._lower_target()
+        if self.state == FSMState.OPEN_GRIP:       return self._open_grip()
+        if self.state == FSMState.RETRACT:         return self._retract()
         return self._done()
 
     def _transition(self, new: FSMState) -> None:
@@ -194,11 +214,27 @@ class FSMCore:
             palm = self._palm_world()
             print(f"[FSM]   drop_pelvis=({p[0]:.3f},{p[1]:.3f},{p[2]:.3f})"
                   f"  palm_z={palm[2]:.3f}")
+        elif new == FSMState.LOWER_TARGET:
+            hover = self._target_hover_world()
+            palm  = self._palm_world()
+            print(f"[FSM]   palm_dist_to_hover={np.linalg.norm(palm-hover):.3f}")
+        elif new == FSMState.OPEN_GRIP:
+            palm  = self._palm_world()
+            cyl   = self._cylinder_world()
+            tgt_z = self._target_surface_z()
+            print(f"[FSM]   palm_z={palm[2]:.3f}  cyl_z={cyl[2]:.3f}"
+                  f"  height_above_target={cyl[2]-tgt_z:.3f}")
+        elif new == FSMState.RETRACT:
+            cyl      = self._cylinder_world()
+            tgt_z    = self._target_surface_z()
+            on_table = self._cylinder_on_target_table()
+            print(f"[FSM]   cyl_z={cyl[2]:.3f}  on_target_table={on_table}")
         elif new == FSMState.DONE:
-            cyl  = self._cylinder_world()
-            tbl_z = self._table_surface_z()
-            print(f"[FSM]   cyl_z={cyl[2]:.3f}  table_z={tbl_z:.3f}"
-                  f"  clearance={cyl[2] - tbl_z:.3f} m")
+            cyl      = self._cylinder_world()
+            tgt_z    = self._target_surface_z()
+            on_table = self._cylinder_on_target_table()
+            print(f"[FSM]   cyl_z={cyl[2]:.3f}  target_z={tgt_z:.3f}"
+                  f"  clearance={cyl[2]-tgt_z:.3f}  on_target_table={on_table}")
         self.state        = new
         self._tick_state  = 0
         self._reach_count = 0   # reset debounce for the new state
@@ -356,14 +392,97 @@ class FSMCore:
         )
 
     def _hover_target(self) -> PolicyOutput:
-        """Step 10 stub: hold in placement corridor; placement not yet implemented."""
-        if self._tick_state == 1:
-            print("[FSM] HOVER_TARGET  in placement corridor — holding (Step 10)")
+        if self._tick_state == 0:
+            print("[FSM] HOVER_TARGET  moving arm above drop point")
+        hover = self._target_hover_world()
+        reach = self._reach_from_world(hover, right_bias=-0.03)
+        palm  = self._palm_world()
+        dist  = float(np.linalg.norm(palm - hover))
+
+        if dist < HOVER_TARGET_THRESHOLD:
+            self._reach_count += 1
+        else:
+            self._reach_count = 0
+
+        if self._reach_count >= DEBOUNCE_REACH:
+            print(f"[FSM] HOVER_TARGET → threshold met  palm_dist={dist:.3f}")
+            self._transition(FSMState.LOWER_TARGET)
+        elif self._tick_state >= HOVER_TARGET_TIMEOUT:
+            print(f"[FSM] HOVER_TARGET → timeout  palm_dist={dist:.3f}")
+            self._transition(FSMState.LOWER_TARGET)
+
+        return PolicyOutput(
+            walk_cmd=(0.0, 0.0, 0.0),
+            reach_target=reach,
+            reach_active=True,
+            grip_closed=True,
+        )
+
+    def _lower_target(self) -> PolicyOutput:
+        if self._tick_state == 0:
+            print("[FSM] LOWER_TARGET  descending arm to release height")
+        place = self._target_place_world()
+        reach = self._reach_from_world(place, right_bias=-0.03)
+        palm  = self._palm_world()
+        dist  = float(np.linalg.norm(palm - place))
+
+        if dist < LOWER_TARGET_THRESHOLD:
+            self._reach_count += 1
+        else:
+            self._reach_count = 0
+
+        if self._reach_count >= DEBOUNCE_REACH:
+            print(f"[FSM] LOWER_TARGET → threshold met  palm_dist={dist:.3f}")
+            self._transition(FSMState.OPEN_GRIP)
+        elif self._tick_state >= LOWER_TARGET_TIMEOUT:
+            print(f"[FSM] LOWER_TARGET → timeout  palm_dist={dist:.3f}")
+            self._transition(FSMState.OPEN_GRIP)
+
+        return PolicyOutput(
+            walk_cmd=(0.0, 0.0, 0.0),
+            reach_target=reach,
+            reach_active=True,
+            grip_closed=True,
+        )
+
+    def _open_grip(self) -> PolicyOutput:
+        if self._tick_state == 0:
+            print("[FSM] OPEN_GRIP  releasing cylinder")
+        place = self._target_place_world()
+        reach = self._reach_from_world(place, right_bias=-0.03)
+
+        if not self._attached:
+            print(f"[FSM] OPEN_GRIP → released  t={self._tick_total}")
+            self._transition(FSMState.RETRACT)
+        elif self._tick_state >= OPEN_GRIP_TIMEOUT:
+            print(f"[FSM] OPEN_GRIP → timeout  attached={self._attached}  t={self._tick_total}")
+            self._transition(FSMState.RETRACT)
+
+        return PolicyOutput(
+            walk_cmd=(0.0, 0.0, 0.0),
+            reach_target=reach,
+            reach_active=True,
+            grip_closed=False,
+        )
+
+    def _retract(self) -> PolicyOutput:
+        if self._tick_state == 0:
+            print("[FSM] RETRACT  raising arm to carry pose")
+        palm  = self._palm_world()
+        tgt_z = self._target_surface_z()
+
+        if palm[2] >= tgt_z + LIFT_DONE_CLEARANCE:
+            print(f"[FSM] RETRACT → arm clear  palm_z={palm[2]:.3f}")
+            self._transition(FSMState.DONE)
+        elif self._tick_state >= RETRACT_TIMEOUT:
+            print(f"[FSM] RETRACT → timeout  palm_z={palm[2]:.3f}")
+            self._transition(FSMState.DONE)
+
         return PolicyOutput(
             walk_cmd=(0.0, 0.0, 0.0),
             reach_target=CARRY_POSE,
             reach_active=True,
-            grip_closed=True,
+            grip_closed=False,
         )
 
     def _done(self) -> PolicyOutput:
@@ -373,7 +492,7 @@ class FSMCore:
             walk_cmd=(0.0, 0.0, 0.0),
             reach_target=CARRY_POSE,
             reach_active=True,
-            grip_closed=self._attached,
+            grip_closed=False,
         )
 
     # ------------------------------------------------------------------ #
@@ -487,6 +606,39 @@ class FSMCore:
         """Frozen drop point expressed in the current pelvis frame."""
         pos, quat = self._pelvis_pose()
         return self._world_to_pelvis(pos, quat, self._target_drop_pt)
+
+    def _target_hover_world(self) -> np.ndarray:
+        """World point HOVER_TARGET_HEIGHT above the frozen drop point."""
+        p = self._target_drop_pt.copy()
+        p[2] = self._target_surface_z() + HOVER_TARGET_HEIGHT
+        return p
+
+    def _target_place_world(self) -> np.ndarray:
+        """World point PLACE_HEIGHT above the frozen drop point (release height)."""
+        p = self._target_drop_pt.copy()
+        p[2] = self._target_surface_z() + PLACE_HEIGHT
+        return p
+
+    def _cylinder_on_target_table(self) -> bool:
+        """True when the cylinder is resting on the target table.
+
+        Checks:
+          1. Cylinder z is within (surface − 0.01, surface + ON_TABLE_Z_MAX).
+          2. Cylinder XY is within the table geom footprint + ON_TABLE_XY_MARGIN.
+        """
+        cyl   = self._cylinder_world()
+        tgt_z = self._target_surface_z()
+        if not (tgt_z - 0.01 <= cyl[2] <= tgt_z + ON_TABLE_Z_MAX):
+            return False
+        if self._tbl_white_geom_id >= 0:
+            gx = float(self._data.geom_xpos[self._tbl_white_geom_id][0])
+            gy = float(self._data.geom_xpos[self._tbl_white_geom_id][1])
+            hx = float(self._model.geom_size[self._tbl_white_geom_id][0])
+            hy = float(self._model.geom_size[self._tbl_white_geom_id][1])
+            return (abs(cyl[0] - gx) <= hx + ON_TABLE_XY_MARGIN and
+                    abs(cyl[1] - gy) <= hy + ON_TABLE_XY_MARGIN)
+        c = self._data.xpos[self._tbl_white_id]
+        return (abs(cyl[0] - c[0]) <= 0.40 and abs(cyl[1] - c[1]) <= 0.30)
 
     # ------------------------------------------------------------------ #
     # Approach commander

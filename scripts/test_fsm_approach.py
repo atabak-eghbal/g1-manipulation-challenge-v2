@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless integration test: SETTLE → APPROACH → HOVER → DESCEND → CLOSE_GRIP → LIFT → DONE."""
+"""Headless integration test: full pick-and-place pipeline through DONE."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def main():
     right_reacher(np.zeros((1, 36), dtype=np.float32))
 
     decimation     = 4
-    MAX_CTRL_TICKS = 2500   # ~50 s: covers full pipeline through LIFT → APPROACH_TARGET → HOVER_TARGET
+    MAX_CTRL_TICKS = 3000   # ~60 s: full pipeline through DONE
 
     target_pos = ctrl.default_joint_pos.copy()
 
@@ -88,18 +88,23 @@ def main():
 
         state = policy._fsm.state
 
-        if state == FSMState.HOVER_TARGET:
-            palm  = policy._fsm._palm_world()
-            cyl   = policy._fsm._cylinder_world()
-            drop  = policy._fsm._target_drop_pt
-            tgt_z = policy._fsm._target_surface_z()
-            print(f"\nPASS — reached HOVER_TARGET at control tick {tick + 1}")
-            print(f"  palm_world  : ({palm[0]:.3f}, {palm[1]:.3f}, {palm[2]:.3f})")
-            print(f"  cyl_world   : ({cyl[0]:.3f}, {cyl[1]:.3f}, {cyl[2]:.3f})")
-            print(f"  drop_world  : ({drop[0]:.3f}, {drop[1]:.3f}, {drop[2]:.3f})")
-            print(f"  target_z    : {tgt_z:.3f}")
-            print(f"  attached    : {grasp_backend.attached}")
-            sys.exit(0)
+        if state == FSMState.DONE:
+            fsm   = policy._fsm
+            cyl   = fsm._cylinder_world()
+            palm  = fsm._palm_world()
+            drop  = fsm._target_drop_pt
+            tgt_z = fsm._target_surface_z()
+            on_tbl = fsm._cylinder_on_target_table()
+            verdict = "PASS" if on_tbl else "FAIL"
+            print(f"\n{verdict} — reached DONE at control tick {tick + 1}")
+            print(f"  palm_world      : ({palm[0]:.3f}, {palm[1]:.3f}, {palm[2]:.3f})")
+            print(f"  cyl_world       : ({cyl[0]:.3f}, {cyl[1]:.3f}, {cyl[2]:.3f})")
+            print(f"  drop_world      : ({drop[0]:.3f}, {drop[1]:.3f}, {drop[2]:.3f})")
+            print(f"  target_z        : {tgt_z:.3f}")
+            print(f"  cyl_clearance   : {cyl[2]-tgt_z:.3f} m")
+            print(f"  on_target_table : {on_tbl}")
+            print(f"  attached        : {grasp_backend.attached}")
+            sys.exit(0 if on_tbl else 1)
 
         pz = float(data.qpos[2])
         if pz < 0.40:
@@ -107,15 +112,17 @@ def main():
             sys.exit(1)
 
     # Timeout
-    cyl_w = policy._fsm._cylinder_world()
-    drop  = policy._fsm._target_drop_pt
+    fsm   = policy._fsm
+    cyl_w = fsm._cylinder_world()
+    drop  = fsm._target_drop_pt
     drop_str = f"({drop[0]:.3f},{drop[1]:.3f},{drop[2]:.3f})" if drop is not None else "None"
     print(f"\n=== TIMEOUT after {MAX_CTRL_TICKS} ticks ===")
-    print(f"  state        : {policy._fsm.state.name}")
-    print(f"  cyl_world    : ({cyl_w[0]:.3f}, {cyl_w[1]:.3f}, {cyl_w[2]:.3f})")
-    print(f"  drop_world   : {drop_str}")
-    print(f"  attached     : {grasp_backend.attached}")
-    print("\nFAIL — did not reach HOVER_TARGET")
+    print(f"  state           : {fsm.state.name}")
+    print(f"  cyl_world       : ({cyl_w[0]:.3f}, {cyl_w[1]:.3f}, {cyl_w[2]:.3f})")
+    print(f"  drop_world      : {drop_str}")
+    print(f"  on_target_table : {fsm._cylinder_on_target_table()}")
+    print(f"  attached        : {grasp_backend.attached}")
+    print("\nFAIL — did not reach DONE")
     sys.exit(1)
 
 
