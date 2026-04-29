@@ -626,3 +626,44 @@ PASS — reached DONE at control tick 1582
 
 - **Pass / Fail:** **Pass — GT FSM baseline complete.**
 - **Next Risk:** Robustness (scene variation, noise) and vision-guided approach (replacing GT geometry lookups).
+
+---
+
+### Post-step-10 finding (visual inspection after commit)
+
+Running `python run.py --policy fsm --no-cameras` revealed the cylinder landing on the **floor**, not the blue table. The test script had reported PASS with `on_target_table=True`, but that was a false positive.
+
+#### Root cause
+
+`_approach_target` used `_in_reach_window(drop_pelvis)` to decide when to stop walking. The reach window `x ∈ [0.20, 0.38], y ∈ [−0.14, 0.02]` checks the drop point expressed in the **current pelvis frame**. During Phase 1 (CW turn), while the robot was at world ≈ (−0.205, −0.013) and yaw ≈ −0.64 rad (still 0.93 rad short of −π/2), the drop world point (−0.300, −0.600) happened to project to pelvis-frame ≈ (0.373, −0.056) — inside the window. The FSM transitioned to HOVER_TARGET immediately, even though the robot was far from the table.
+
+The arm extended toward world-frame ≈ (0.095, −0.236) (arm_reach × cos/sin(−0.64) offset from pelvis), not toward the table at (−0.300, −0.600). The cylinder was released there and landed on the floor.
+
+The `on_target_table=True` report was also a false positive: at DONE entry with cyl at (−0.067, −0.256, 0.650), `_cylinder_on_target_table()` should have returned False (|−0.256 − (−0.80)| = 0.544 > 0.30 = hy + margin). The fallback path (`tbl_white_id >= 0` check missing) allowed `xpos[-1]` (last body in model, arbitrary position) to be used, giving a spurious True.
+
+#### Fix — `policies/fsm_core.py`
+
+**1. World-proximity gate (new constant + helper):**
+
+Added `TARGET_APPROACH_DIST_THRESH = 0.20 m` and `_near_target_waypoint()` which requires BOTH:
+- `|yaw + π/2| < PHASE1_ALIGN_TOL` (robot is facing roughly −y; Phase 1 complete)
+- World-frame distance from pelvis to standing waypoint `(drop_x, drop_y + APPROACH_TARGET_X)` < 0.20 m
+
+**2. Replaced reach-window check in `_approach_target`:**
+
+```python
+# Before
+if self._in_reach_window(drop):   # drop = drop point in pelvis frame
+
+# After
+if self._near_target_waypoint():  # world proximity + yaw gate
+```
+
+The standing waypoint `(−0.300, −0.600 + 0.34) = (−0.300, −0.260)` is where the robot needs to be for the arm to extend toward (−0.300, −0.600) at yaw = −π/2. Only when the pelvis is within 0.20 m of that waypoint AND facing the right direction does the FSM advance.
+
+**3. Hardened `_cylinder_on_target_table()` fallback:**
+
+Added `if self._tbl_white_id >= 0:` guard before the body-centre fallback, and return `False` when both IDs are −1. Previously, `xpos[-1]` (Python negative indexing into the MuJoCo array) could read an arbitrary body position when `tbl_white_id = −1`.
+
+- **Files Changed:** `policies/fsm_core.py`.
+- **Pass / Fail:** Pending re-run after fix.

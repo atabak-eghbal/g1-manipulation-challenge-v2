@@ -81,6 +81,11 @@ VX_P1 = 0.12   # m/s: minimum effective forward speed for the walker
 WZ_P1 = 1.0    # rad/s: full angular rate so the robot actually turns
 PHASE1_ALIGN_TOL = 0.40   # rad: exit Phase 1 when |yaw − (−π/2)| < this
 
+# World-frame proximity to the standing waypoint required before HOVER_TARGET.
+# Replaces the pelvis-frame reach-window check, which fires too early mid-turn
+# (the drop point can project into the window at wrong orientations).
+TARGET_APPROACH_DIST_THRESH = 0.20   # m: pelvis must be within this of the waypoint
+
 # ---- Reacher workspace bounds in pelvis frame ----
 # From the training spec; targets outside are clamped before being sent.
 _REACH_LOW  = np.array([-0.30, -0.60, -0.40], dtype=np.float32)
@@ -368,15 +373,18 @@ class FSMCore:
         if self._tick_state == 1:
             print("[FSM] APPROACH_TARGET  walking toward target table")
         drop = self._target_drop_in_pelvis()
-        if self._in_reach_window(drop):
+        if self._near_target_waypoint():
             self._reach_count += 1
             walk_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         else:
             self._reach_count = 0
             walk_cmd = self._target_approach_walk_cmd(drop)
         if self._reach_count >= TARGET_REACH_DEBOUNCE:
-            print(f"[FSM] drop point in reach window: "
-                  f"pelvis=({drop[0]:.3f},{drop[1]:.3f},{drop[2]:.3f})")
+            ppos = self._data.qpos[:3]
+            yaw  = self._pelvis_yaw()
+            print(f"[FSM] near target waypoint: "
+                  f"pelvis=({ppos[0]:.3f},{ppos[1]:.3f})  yaw={yaw:.3f}  "
+                  f"drop_pelvis=({drop[0]:.3f},{drop[1]:.3f},{drop[2]:.3f})")
             self._transition(FSMState.HOVER_TARGET)
         elif self._tick_state >= TARGET_APPROACH_TIMEOUT:
             ppos = self._data.qpos[:3]
@@ -637,8 +645,10 @@ class FSMCore:
             hy = float(self._model.geom_size[self._tbl_white_geom_id][1])
             return (abs(cyl[0] - gx) <= hx + ON_TABLE_XY_MARGIN and
                     abs(cyl[1] - gy) <= hy + ON_TABLE_XY_MARGIN)
-        c = self._data.xpos[self._tbl_white_id]
-        return (abs(cyl[0] - c[0]) <= 0.40 and abs(cyl[1] - c[1]) <= 0.30)
+        if self._tbl_white_id >= 0:
+            c = self._data.xpos[self._tbl_white_id]
+            return (abs(cyl[0] - c[0]) <= 0.40 and abs(cyl[1] - c[1]) <= 0.30)
+        return False
 
     # ------------------------------------------------------------------ #
     # Approach commander
@@ -703,6 +713,25 @@ class FSMCore:
         vy = float(np.clip(K_VY * left_err, -VY_CAP, VY_CAP))
         wz = float(np.clip(K_WZ * a_err,   -WZ_CAP, WZ_CAP))
         return (vx, vy, wz)
+
+    def _near_target_waypoint(self) -> bool:
+        """True when robot is close to the standing waypoint AND facing roughly −y.
+
+        The pelvis-frame reach-window check (`_in_reach_window`) is NOT used for
+        the target approach because the drop point can satisfy the window even when
+        the robot is mid-turn and far from the table.  This world-frame check
+        requires both conditions simultaneously.
+        """
+        yaw = self._pelvis_yaw()
+        if abs(yaw + np.pi / 2) > PHASE1_ALIGN_TOL:
+            return False
+        pelvis = self._data.qpos[:3]
+        drop_w = self._target_drop_pt
+        stand_x = float(drop_w[0])
+        stand_y = float(drop_w[1]) + APPROACH_TARGET_X
+        ex = stand_x - float(pelvis[0])
+        ey = stand_y - float(pelvis[1])
+        return float(np.sqrt(ex * ex + ey * ey)) < TARGET_APPROACH_DIST_THRESH
 
     def _in_reach_window(self, cyl: np.ndarray) -> bool:
         return (REACH_X_MIN < cyl[0] < REACH_X_MAX and
