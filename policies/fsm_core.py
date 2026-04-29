@@ -52,6 +52,21 @@ DEBOUNCE_REACH = 6   # consecutive ticks palm must be within threshold
 # ---- Lift success criterion ----
 LIFT_DONE_CLEARANCE = 0.25  # m above table top — cylinder visibly off the surface
 
+# ---- Target table approach ----
+# Drop point is 5 cm inside the near edge of the target table (y-direction).
+# Near edge = table_white geom_center_y + half_size_y (less-negative y = robot side).
+TARGET_NEAR_EDGE_INSET  = 0.05   # m inward from near edge
+TARGET_REACH_DEBOUNCE   = 8      # consecutive in-window ticks → HOVER_TARGET
+TARGET_APPROACH_TIMEOUT = 900    # ~18 s fallback (large turn required from source side)
+
+# Phase 1 of target approach: turn CW to face -y before driving toward standing waypoint.
+# Use VX_SLOW so the walker actually responds to the command (vx=0.06 is below effective
+# minimum, giving near-zero turn rate).  WZ_P1 = 1.0 (vel_max_angular) creates a tight
+# turning circle: R = VX_P1 / WZ_P1 ≈ 0.12 m — small enough to land in the reach window.
+VX_P1 = 0.12   # m/s: minimum effective forward speed for the walker
+WZ_P1 = 1.0    # rad/s: full angular rate so the robot actually turns
+PHASE1_ALIGN_TOL = 0.40   # rad: exit Phase 1 when |yaw − (−π/2)| < this
+
 # ---- Reacher workspace bounds in pelvis frame ----
 # From the training spec; targets outside are clamped before being sent.
 _REACH_LOW  = np.array([-0.30, -0.60, -0.40], dtype=np.float32)
@@ -69,6 +84,8 @@ class FSMState(Enum):
     DESCEND_SOURCE  = auto()
     CLOSE_GRIP      = auto()   # close fingers; wait for backend to confirm attach
     LIFT_SOURCE     = auto()   # raise arm to carry pose; confirm cylinder left table
+    APPROACH_TARGET = auto()   # walk/turn toward target-table placement corridor
+    HOVER_TARGET    = auto()   # Step 10 stub: hold in corridor, don't place yet
     DONE            = auto()
 
 
@@ -87,22 +104,25 @@ class FSMCore:
         self._data  = data
 
         # ---- MuJoCo ID cache ----
-        self._rb_id       = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "red_block")
-        self._tbl_id      = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
-        self._palm_id     = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "right_palm")
-        # Geom-based table surface is more accurate than body-centre + offset.
-        self._tbl_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+        self._rb_id            = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "red_block")
+        self._tbl_id           = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table")
+        self._palm_id          = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "right_palm")
+        self._tbl_geom_id      = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+        self._tbl_white_id     = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "table_white")
+        self._tbl_white_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_white_top")
 
-        self.state        = FSMState.SETTLE
-        self._tick_total  = 0
-        self._tick_state  = 0
-        self._reach_count = 0   # general-purpose debounce counter
-        self._attached    = False  # updated each tick by FSMPolicy from grasp backend
+        self.state             = FSMState.SETTLE
+        self._tick_total       = 0
+        self._tick_state       = 0
+        self._reach_count      = 0     # general-purpose debounce counter
+        self._attached         = False  # updated each tick by FSMPolicy from grasp backend
+        self._target_drop_pt: np.ndarray | None = None  # frozen when APPROACH_TARGET begins
 
         print(
             f"[FSM] init  state={self.state.name}"
             f"  rb={self._rb_id}  tbl={self._tbl_id}"
             f"  palm={self._palm_id}  tbl_geom={self._tbl_geom_id}"
+            f"  tbl_white={self._tbl_white_id}  tbl_white_geom={self._tbl_white_geom_id}"
         )
 
     # ------------------------------------------------------------------ #
@@ -133,6 +153,8 @@ class FSMCore:
         if self.state == FSMState.DESCEND_SOURCE:  return self._descend_source()
         if self.state == FSMState.CLOSE_GRIP:      return self._close_grip()
         if self.state == FSMState.LIFT_SOURCE:     return self._lift_source()
+        if self.state == FSMState.APPROACH_TARGET: return self._approach_target()
+        if self.state == FSMState.HOVER_TARGET:    return self._hover_target()
         return self._done()
 
     def _transition(self, new: FSMState) -> None:
@@ -156,6 +178,22 @@ class FSMCore:
             palm = self._palm_world()
             cyl  = self._cylinder_world()
             print(f"[FSM]   palm_z={palm[2]:.3f}  cyl_z={cyl[2]:.3f}  attached={self._attached}")
+        elif new == FSMState.APPROACH_TARGET:
+            # Freeze the drop point in world frame at the moment of state entry.
+            self._target_drop_pt = self._target_drop_world()
+            tgt_z = self._target_surface_z()
+            p = self._target_drop_pt
+            dist = float(np.linalg.norm(self._palm_world() - p))
+            ppos = self._data.qpos[:3]
+            yaw  = self._pelvis_yaw()
+            print(f"[FSM]   drop_world=({p[0]:.3f},{p[1]:.3f},{p[2]:.3f})"
+                  f"  target_z={tgt_z:.4f}  palm_dist={dist:.3f}"
+                  f"  pelvis=({ppos[0]:.3f},{ppos[1]:.3f})  yaw={yaw:.3f}")
+        elif new == FSMState.HOVER_TARGET:
+            p    = self._target_drop_in_pelvis()
+            palm = self._palm_world()
+            print(f"[FSM]   drop_pelvis=({p[0]:.3f},{p[1]:.3f},{p[2]:.3f})"
+                  f"  palm_z={palm[2]:.3f}")
         elif new == FSMState.DONE:
             cyl  = self._cylinder_world()
             tbl_z = self._table_surface_z()
@@ -276,13 +314,51 @@ class FSMCore:
         tbl_z = self._table_surface_z()
 
         if palm[2] >= tbl_z + LIFT_DONE_CLEARANCE:
-            print(f"[FSM] LIFT_SOURCE → done"
+            print(f"[FSM] LIFT_SOURCE → approach target"
                   f"  palm_z={palm[2]:.3f}  clearance={palm[2] - tbl_z:.3f}")
-            self._transition(FSMState.DONE)
+            self._transition(FSMState.APPROACH_TARGET)
         elif self._tick_state >= LIFT_SOURCE_TIMEOUT:
-            print(f"[FSM] LIFT_SOURCE → timeout  palm_z={palm[2]:.3f}")
-            self._transition(FSMState.DONE)
+            print(f"[FSM] LIFT_SOURCE → timeout → approach target  palm_z={palm[2]:.3f}")
+            self._transition(FSMState.APPROACH_TARGET)
 
+        return PolicyOutput(
+            walk_cmd=(0.0, 0.0, 0.0),
+            reach_target=CARRY_POSE,
+            reach_active=True,
+            grip_closed=True,
+        )
+
+    def _approach_target(self) -> PolicyOutput:
+        if self._tick_state == 1:
+            print("[FSM] APPROACH_TARGET  walking toward target table")
+        drop = self._target_drop_in_pelvis()
+        if self._in_reach_window(drop):
+            self._reach_count += 1
+            walk_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        else:
+            self._reach_count = 0
+            walk_cmd = self._target_approach_walk_cmd(drop)
+        if self._reach_count >= TARGET_REACH_DEBOUNCE:
+            print(f"[FSM] drop point in reach window: "
+                  f"pelvis=({drop[0]:.3f},{drop[1]:.3f},{drop[2]:.3f})")
+            self._transition(FSMState.HOVER_TARGET)
+        elif self._tick_state >= TARGET_APPROACH_TIMEOUT:
+            ppos = self._data.qpos[:3]
+            print(f"[FSM] APPROACH_TARGET → timeout  "
+                  f"drop_pelvis=({drop[0]:.3f},{drop[1]:.3f})  "
+                  f"pelvis=({ppos[0]:.3f},{ppos[1]:.3f})")
+            self._transition(FSMState.HOVER_TARGET)
+        return PolicyOutput(
+            walk_cmd=walk_cmd,
+            reach_target=CARRY_POSE,
+            reach_active=True,
+            grip_closed=True,
+        )
+
+    def _hover_target(self) -> PolicyOutput:
+        """Step 10 stub: hold in placement corridor; placement not yet implemented."""
+        if self._tick_state == 1:
+            print("[FSM] HOVER_TARGET  in placement corridor — holding (Step 10)")
         return PolicyOutput(
             walk_cmd=(0.0, 0.0, 0.0),
             reach_target=CARRY_POSE,
@@ -306,6 +382,13 @@ class FSMCore:
 
     def _pelvis_pose(self) -> tuple[np.ndarray, np.ndarray]:
         return self._data.qpos[:3].copy(), self._data.qpos[3:7].copy()
+
+    def _pelvis_yaw(self) -> float:
+        """Extract yaw (Z-rotation) from the pelvis quaternion."""
+        qw, qx, qy, qz = (float(self._data.qpos[3]), float(self._data.qpos[4]),
+                           float(self._data.qpos[5]), float(self._data.qpos[6]))
+        return np.arctan2(2.0 * (qw * qz + qx * qy),
+                          1.0 - 2.0 * (qy * qy + qz * qz))
 
     @staticmethod
     def _world_to_pelvis(
@@ -375,6 +458,36 @@ class FSMCore:
         local[1] = min(float(local[1]), right_bias)
         return self._clip_reach_target(local)
 
+    def _target_surface_z(self) -> float:
+        """World Z of the target table's top surface."""
+        if self._tbl_white_geom_id >= 0:
+            return float(
+                self._data.geom_xpos[self._tbl_white_geom_id][2]
+                + self._model.geom_size[self._tbl_white_geom_id][2]
+            )
+        return float(self._data.xpos[self._tbl_white_id][2]) + 0.02
+
+    def _target_drop_world(self) -> np.ndarray:
+        """World point 5 cm inside the near edge of the target table, on the surface.
+
+        Near edge: the edge with the less-negative y value (closest to the robot's
+        starting position).  Inset of TARGET_NEAR_EDGE_INSET moves into the table.
+        """
+        if self._tbl_white_geom_id >= 0:
+            gx  = float(self._data.geom_xpos[self._tbl_white_geom_id][0])
+            gy  = float(self._data.geom_xpos[self._tbl_white_geom_id][1])
+            near_edge_y = gy + float(self._model.geom_size[self._tbl_white_geom_id][1])
+            drop_y = near_edge_y - TARGET_NEAR_EDGE_INSET
+            drop_z = self._target_surface_z()
+            return np.array([gx, drop_y, drop_z], dtype=np.float64)
+        c = self._data.xpos[self._tbl_white_id].copy()
+        return np.array([c[0], c[1] + 0.20, c[2] + 0.02], dtype=np.float64)
+
+    def _target_drop_in_pelvis(self) -> np.ndarray:
+        """Frozen drop point expressed in the current pelvis frame."""
+        pos, quat = self._pelvis_pose()
+        return self._world_to_pelvis(pos, quat, self._target_drop_pt)
+
     # ------------------------------------------------------------------ #
     # Approach commander
     # ------------------------------------------------------------------ #
@@ -396,6 +509,47 @@ class FSMCore:
             K_WZ * np.arctan2(cyl[1], max(cyl[0], 0.15)),
             -WZ_CAP, WZ_CAP,
         ))
+        return (vx, vy, wz)
+
+    def _target_approach_walk_cmd(self, drop_pelvis: np.ndarray) -> tuple[float, float, float]:
+        """Two-phase world-frame approach to the target-table placement corridor.
+
+        Phase 1 — turn CW to face -y: uses vx=VX_P1 (not 0) so the walker stays
+          stable.  R = VX_P1/WZ_P1 = 0.24 m; at this radius the target table
+          remains outside the turning circle, so Phase 2 can reach it head-on.
+
+        Phase 2 — drive to standing waypoint: once |yaw + π/2| < PHASE1_ALIGN_TOL,
+          decompose world-frame positional error into forward/lateral components
+          and apply staircase vx + proportional vy + bearing wz.
+        """
+        pelvis_pos = self._data.qpos[:3]
+        yaw = self._pelvis_yaw()
+
+        # ---- Phase 1: CW turn until facing -y --------------------------------
+        if abs(yaw + np.pi / 2) > PHASE1_ALIGN_TOL:
+            return (VX_P1, 0.0, -WZ_P1)
+
+        # ---- Phase 2: drive toward standing waypoint -------------------------
+        # Standing waypoint: APPROACH_TARGET_X m toward robot from the drop point.
+        drop_w  = self._target_drop_pt
+        stand_x = float(drop_w[0])
+        stand_y = float(drop_w[1]) + APPROACH_TARGET_X   # e.g. -0.60 + 0.34 = -0.26
+
+        ex = stand_x - float(pelvis_pos[0])
+        ey = stand_y - float(pelvis_pos[1])
+        dist = float(np.sqrt(ex * ex + ey * ey))
+
+        bearing  = float(np.arctan2(ey, ex))
+        a_err    = (bearing - yaw + np.pi) % (2.0 * np.pi) - np.pi
+
+        cos_y, sin_y = float(np.cos(yaw)), float(np.sin(yaw))
+        left_err = -ex * sin_y + ey * cos_y
+
+        if dist > 0.35:   vx = VX_FAST
+        elif dist > 0.18: vx = VX_MED
+        else:             vx = VX_SLOW
+        vy = float(np.clip(K_VY * left_err, -VY_CAP, VY_CAP))
+        wz = float(np.clip(K_WZ * a_err,   -WZ_CAP, WZ_CAP))
         return (vx, vy, wz)
 
     def _in_reach_window(self, cyl: np.ndarray) -> bool:

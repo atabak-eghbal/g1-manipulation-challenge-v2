@@ -436,3 +436,90 @@ PASS — reached DONE at control tick 763
 
 - **Pass / Fail:** **Pass.**
 - **Next Risk:** Step 9 — place the cylinder on the target table (approach target table, descend, release grip, retract arm to carry pose).
+
+---
+
+## [2026-04-28] Step 9: Target-Table Transport (LIFT_SOURCE → APPROACH_TARGET → HOVER_TARGET)
+
+- **Goal:** Walk the robot from the source table to the target table's placement corridor while keeping the cylinder in the carry pose, then stub HOVER_TARGET.
+- **Files Changed:** `policies/fsm_core.py`, `scripts/test_fsm_approach.py`.
+
+---
+
+### Decisions and Findings
+
+#### Decision 1 — Carry pose during transport
+
+`CARRY_POSE = (0.3, -0.2, 0.2)` (already defined in Step 8) is held throughout APPROACH_TARGET and HOVER_TARGET. `reach_active=True`, `grip_closed=True`. The cylinder rides the palm with no extra logic needed.
+
+#### Decision 2 — Drop-point geometry (frozen at APPROACH_TARGET entry)
+
+`_target_drop_world()` computes the world-frame drop point once and freezes it in `self._target_drop_pt`:
+- `drop_x = geom_center_x` of `table_white_top` = −0.300 m
+- `drop_y = geom_center_y + half_size_y − TARGET_NEAR_EDGE_INSET` = −0.80 + 0.25 − 0.05 = **−0.60 m** (5 cm inside the near edge)
+- `drop_z = geom_surface_z = 0.633 m`
+
+#### Decision 3 — Placement corridor (reach window)
+
+The existing APPROACH_SOURCE reach window `x ∈ [0.20, 0.38], y ∈ [−0.14, 0.02]` is reused for the drop point expressed in the pelvis frame. `TARGET_REACH_DEBOUNCE = 8` consecutive in-window ticks required before transitioning to HOVER_TARGET.
+
+#### Decision 4 — Two-phase target navigation
+
+The robot starts APPROACH_TARGET at approximately (−0.346, −0.008) facing +x (yaw ≈ 0). The drop point is at (−0.30, −0.60). For the drop to land in the pelvis-frame reach window while the robot faces −y, the robot needs to be at px ∈ [−0.32, −0.16], py ∈ [−0.40, −0.22].
+
+**Failed attempts (3 variations):**
+- *vx=0, wz=±0.25*: Walker barely responds — yaw rate ≈ 0.053 rad/s (vs 0.25 commanded). 900-tick timeout never reached the window.
+- *vx=0.06, wz=0.25*: Same low response — robot moves 0.014 m/s instead of 0.06 m/s; yaw barely changes.
+- *vx=0.12, wz=0.25*: Orbit radius R=0.48 m; standing waypoint is inside the turning circle; robot never converges.
+
+**Root cause:** `vel_max_angular = 1.0` — WZ_CAP=0.25 was only 25% of what the walker can handle. The walker needs substantially larger angular commands to actually turn.
+
+**Fix — Phase 1:** `(VX_P1=0.12, vy=0, WZ_P1=−1.0)` until `|yaw + π/2| < 0.40 rad`. With wz=1.0 (vel_max_angular), the robot actually turns CW at sufficient rate. The small turning circle lands the robot near the reach window during Phase 1 itself.
+
+**Fix — Phase 2:** Once facing −y, standard bearing-based staircase (vx, vy=K_VY·left_err, wz=K_WZ·a_err) toward the standing waypoint at (drop_x, drop_y + APPROACH_TARGET_X) = (−0.30, −0.26).
+
+In practice the reach window was satisfied **during Phase 1** (at tick 439 after APPROACH_TARGET entry, yaw ≈ −0.64 rad, pelvis ≈ (−0.205, −0.013)), so Phase 2 never needed to execute.
+
+---
+
+### Observed geometry (from test run)
+
+```
+APPROACH_TARGET entry: drop_world=(−0.300,−0.600,0.633)  pelvis=(−0.346,−0.008)  yaw=0.064
+HOVER_TARGET entry:    drop_pelvis=(0.373,−0.056,−0.123)  palm_z=0.870
+                       [reach window satisfied: x=0.373 ∈ [0.20,0.38], y=−0.056 ∈ [−0.14,0.02]]
+```
+
+**Cylinder status at HOVER_TARGET:** still attached (grip_closed=True throughout).
+**Walker stability:** robot did not fall; palm_z=0.870 throughout transport.
+
+---
+
+### FSM sequence (full pipeline through HOVER_TARGET)
+
+```
+SETTLE (150 ticks)
+  → APPROACH_SOURCE: 84 ticks
+  → HOVER_SOURCE: 26 ticks (threshold)
+  → DESCEND_SOURCE: 300 ticks (timeout)
+  → CLOSE_GRIP: 1 tick (attached)
+  → LIFT_SOURCE: 200 ticks (timeout)
+  → APPROACH_TARGET: 439 ticks (reach window)
+  → HOVER_TARGET (tick 1202, holding)
+```
+
+---
+
+### Test result
+
+```
+PASS — reached HOVER_TARGET at control tick 1203
+  palm_world  : (−0.051, −0.238, 0.870)   [during APPROACH_TARGET Phase 1 turn]
+  cyl_world   : (−0.026, −0.223, 0.863)   [cylinder tracking palm, attached]
+  drop_world  : (−0.300, −0.600, 0.633)   [frozen drop point on target table]
+  target_z    : 0.633
+  attached    : True
+```
+
+- **Pass / Fail:** **Pass.**
+- **Next Risk:** Step 10 — descend arm to drop height above target table, release grip, retract to carry pose.

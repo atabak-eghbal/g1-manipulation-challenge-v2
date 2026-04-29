@@ -74,7 +74,7 @@ def main():
     right_reacher(np.zeros((1, 36), dtype=np.float32))
 
     decimation     = 4
-    MAX_CTRL_TICKS = 1500   # ~30 s: covers full pipeline through LIFT → DONE
+    MAX_CTRL_TICKS = 2500   # ~50 s: covers full pipeline through LIFT → APPROACH_TARGET → HOVER_TARGET
 
     target_pos = ctrl.default_joint_pos.copy()
 
@@ -88,16 +88,16 @@ def main():
 
         state = policy._fsm.state
 
-        if state == FSMState.DONE:
-            palm = policy._fsm._palm_world()
-            cyl  = policy._fsm._cylinder_world()
-            tbl_z = policy._fsm._table_surface_z()
-            clearance = cyl[2] - tbl_z
-            print(f"\nPASS — reached DONE at control tick {tick + 1}")
+        if state == FSMState.HOVER_TARGET:
+            palm  = policy._fsm._palm_world()
+            cyl   = policy._fsm._cylinder_world()
+            drop  = policy._fsm._target_drop_pt
+            tgt_z = policy._fsm._target_surface_z()
+            print(f"\nPASS — reached HOVER_TARGET at control tick {tick + 1}")
             print(f"  palm_world  : ({palm[0]:.3f}, {palm[1]:.3f}, {palm[2]:.3f})")
             print(f"  cyl_world   : ({cyl[0]:.3f}, {cyl[1]:.3f}, {cyl[2]:.3f})")
-            print(f"  table_z     : {tbl_z:.3f}")
-            print(f"  cyl clearance : {clearance:.3f} m above table")
+            print(f"  drop_world  : ({drop[0]:.3f}, {drop[1]:.3f}, {drop[2]:.3f})")
+            print(f"  target_z    : {tgt_z:.3f}")
             print(f"  attached    : {grasp_backend.attached}")
             sys.exit(0)
 
@@ -107,15 +107,15 @@ def main():
             sys.exit(1)
 
     # Timeout
-    cyl   = policy._fsm._cylinder_in_pelvis()
-    tbl_z = policy._fsm._table_surface_z()
     cyl_w = policy._fsm._cylinder_world()
+    drop  = policy._fsm._target_drop_pt
+    drop_str = f"({drop[0]:.3f},{drop[1]:.3f},{drop[2]:.3f})" if drop is not None else "None"
     print(f"\n=== TIMEOUT after {MAX_CTRL_TICKS} ticks ===")
     print(f"  state        : {policy._fsm.state.name}")
-    print(f"  cyl pelvis   : ({cyl[0]:.3f}, {cyl[1]:.3f}, {cyl[2]:.3f})")
-    print(f"  cyl world z  : {cyl_w[2]:.3f}  table_z={tbl_z:.3f}")
+    print(f"  cyl_world    : ({cyl_w[0]:.3f}, {cyl_w[1]:.3f}, {cyl_w[2]:.3f})")
+    print(f"  drop_world   : {drop_str}")
     print(f"  attached     : {grasp_backend.attached}")
-    print("\nFAIL — did not reach DONE")
+    print("\nFAIL — did not reach HOVER_TARGET")
     sys.exit(1)
 
 
