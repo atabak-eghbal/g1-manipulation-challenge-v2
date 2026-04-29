@@ -41,6 +41,7 @@ import mujoco
 import numpy as np
 
 from common.controller import WalkerReacherController
+from common.grasp import KinematicAttachment
 from common.onnx_policy import ONNXPolicy
 from common.scene import CameraRenderer, reset_robot
 from policies.fsm import FSMPolicy
@@ -135,9 +136,12 @@ def main():
   ctrl = WalkerReacherController(model, data, walker, croucher, rotator, config,
                                  right_reacher=right_reacher)
 
+  grasp_backend = None
   if args.policy == "fsm":
-    policy = FSMPolicy(ctrl)
-    print("Policy: FSM (autonomous)")
+    rb_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "red_block")
+    grasp_backend = KinematicAttachment(model, data, ctrl.right_palm_site_id, rb_body_id)
+    policy = FSMPolicy(ctrl, grasp_backend=grasp_backend)
+    print("Policy: FSM (autonomous) + KinematicAttachment grasp backend")
   else:
     policy = KeyboardPolicy(ctrl)
     print("Policy: keyboard (manual)")
@@ -247,6 +251,8 @@ def main():
           target_pos = ctrl.step()
         ctrl.apply_pd_control(target_pos)
         mujoco.mj_step(model, data)
+        if grasp_backend is not None:
+          grasp_backend.tick(ctrl.grip_closed)
         control_step += 1
         sim_time += model.opt.timestep
 

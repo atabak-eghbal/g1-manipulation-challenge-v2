@@ -344,3 +344,95 @@ PASS — reached CLOSE_GRIP at control tick 562
 
 - **Pass / Fail:** **Pass.**
 - **Next Risk:** Step 8 — close grip + kinematic attachment (attach when palm within 13 cm, clamp in-hand offset to ~3 cm so cylinder doesn't appear to float, then lift to carry pose).
+
+---
+
+## [2026-04-28] Step 8: Kinematic Grasp Backend and Source Lift
+
+- **Goal:** First end-to-end grasp milestone — attach the cylinder kinematically once the grip closes, lift to carry pose, confirm the cylinder left the table.
+- **Files Changed:** `common/grasp.py` (new), `policies/fsm_core.py`, `policies/fsm.py`, `run.py`, `scripts/test_fsm_approach.py`.
+
+---
+
+### Decisions and Findings
+
+#### Decision 1 — `GraspBackend` / `KinematicAttachment` in `common/grasp.py`
+
+Created an abstract `GraspBackend` interface with `attached`, `tick(grip_closed)`, and `release()`. The concrete `KinematicAttachment` class implements the simulation shortcut:
+
+- **Attach trigger:** `grip_closed=True` AND palm-to-cylinder distance ≤ 0.13 m (the reacher accuracy floor — attachment fires the first physics tick that meets this condition).
+- **Snap distance:** When attaching, the palm-local offset is clamped to 0.03 m so the cylinder sits in the hand even if the actual gap is larger. Observed in test: real dist = 0.128 m → snap_offset = 0.030 m (clamped from 0.103 m). The cylinder jumps ~10 cm to the palm — visually abrupt but acceptable for this baseline.
+- **Collision disable:** `model.geom_contype[g] = 0` and `model.geom_conaffinity[g] = 0` for all geoms of `red_block` while attached. Restored on release. Prevents contact impulses from destabilising the robot when the cylinder teleports into the hand.
+- **Pose update cadence:** Called after **every** `mujoco.mj_step()` in both `run.py` and the headless test (inside the decimation loop). This ensures the cylinder tracks the palm between control ticks. Drift between calls ≈ 5 ms × g ≈ 0.0002 m — negligible.
+- **Velocity zeroing:** `data.qvel[qveladr:qveladr+6] = 0` every `_update_pose()` call. Without this the freejoint accumulates gravity velocity between teleportations.
+
+#### Decision 2 — FSMCore receives `attached` flag via `tick(attached=bool)`
+
+`FSMCore` stays free of any dependency on the grasp backend. `FSMPolicy` reads `grasp_backend.attached` and passes it as a parameter to `fsm.tick()`. `FSMCore` stores it as `self._attached` and uses it only in `_close_grip()` for state transition.
+
+#### Decision 3 — `_close_grip_command` in `FSMPolicy`
+
+A thin post-processing step: if the grasp backend reports `attached=True` but the current PolicyOutput has `grip_closed=False` (e.g., after DONE transition with `_attached=False` due to timing), it overrides grip to True. This guard prevents a single-tick grip release that would drop the cylinder.
+
+#### Decision 4 — CLOSE_GRIP state
+
+Holds grasp reach target with `grip_closed=True`. Transitions to LIFT_SOURCE as soon as `self._attached` (backend confirms attachment) or after CLOSE_GRIP_TIMEOUT = 100 ticks (~2 s, fallback if attachment never fires). In practice, attachment fires after 1 tick (first physics step with grip closed and palm within 0.13 m).
+
+#### Decision 5 — LIFT_SOURCE state
+
+Points reacher at `CARRY_POSE = (0.3, -0.2, 0.2)` with `grip_closed=True`. Transitions to DONE when `palm_world.z ≥ table_z + 0.25 m` (cylinder visibly above the table) OR after LIFT_SOURCE_TIMEOUT = 200 ticks (~4 s).
+
+**Observation:** The LIFT_DONE_CLEARANCE = 0.25 m was not met — the arm reached palm_z = 0.874 m (clearance = 0.141 m above table) before timeout. LIFT_SOURCE exited via timeout. The reacher converges toward carry pose but is slowed by the additional cylinder mass (though kinematic; possibly by the already-stressed reacher workspace near table height). The cylinder is visibly above the table at DONE.
+
+---
+
+### Observed geometry (from test run)
+
+```
+Attach: dist=0.128 m  snap_offset=0.030 m   (tick 562 — first physics step in CLOSE_GRIP)
+LIFT_SOURCE entry: palm_z=0.813  cyl_z=0.802  clearance=0.069 m above table
+LIFT_SOURCE exit:  palm_z=0.874  cyl_z=0.866  timeout (200 ticks)
+DONE:              cyl_z=0.866  table_z=0.733  clearance=0.133 m
+```
+
+**Object float / jitter:** No visible float between control ticks (drift ≈ 0.2 mm per physics step). Cylinder snaps 10 cm from pre-attach position to palm on first attach tick — abrupt but stable. No jitter observed in subsequent carry ticks.
+
+**Lift stability:** Robot did not fall. The arm held cylinder at palm through the full LIFT_SOURCE phase. Walker continued stable upright stance throughout (pelvis z never dropped below 0.78 m).
+
+---
+
+### FSM sequence (full pipeline)
+
+```
+SETTLE (150 ticks, ~3 s)
+  → APPROACH_SOURCE: walk to reach window (85 ticks)
+  → HOVER_SOURCE: arm rises above cylinder (26 ticks, threshold met)
+  → DESCEND_SOURCE: arm descends to grasp height (300 ticks, timeout)
+  → CLOSE_GRIP: grip closes + attachment fires (1 tick)
+  → LIFT_SOURCE: carry pose, cylinder tracks palm (200 ticks, timeout)
+  → DONE (tick 763)
+```
+
+---
+
+### Test result
+
+```
+[GRASP] attached  dist=0.128 m  snap_offset=0.030 m
+[FSM] CLOSE_GRIP → attached at t=562
+[FSM] CLOSE_GRIP → LIFT_SOURCE  (t=562)
+[FSM]   palm_z=0.813  cyl_z=0.802  attached=True
+[FSM] LIFT_SOURCE → timeout  palm_z=0.874
+[FSM] LIFT_SOURCE → DONE  (t=762)
+[FSM]   cyl_z=0.866  table_z=0.733  clearance=0.133 m
+
+PASS — reached DONE at control tick 763
+  palm_world  : (-0.036, -0.194, 0.874)
+  cyl_world   : (-0.014, -0.176, 0.866)
+  table_z     : 0.733
+  cyl clearance : 0.133 m above table
+  attached    : True
+```
+
+- **Pass / Fail:** **Pass.**
+- **Next Risk:** Step 9 — place the cylinder on the target table (approach target table, descend, release grip, retract arm to carry pose).

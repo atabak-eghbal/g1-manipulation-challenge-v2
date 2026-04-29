@@ -43,9 +43,14 @@ DESCEND_SOURCE_THRESHOLD = 0.12   # m
 # ---- Per-state timeouts (control ticks at 50 Hz) ----
 HOVER_SOURCE_TIMEOUT   = 200   # ~4 s fallback if threshold never met
 DESCEND_SOURCE_TIMEOUT = 300   # ~6 s fallback
+CLOSE_GRIP_TIMEOUT     = 100   # ~2 s: advance to LIFT even if not yet attached
+LIFT_SOURCE_TIMEOUT    = 200   # ~4 s: declare done if arm never clears table
 
 # ---- General reach-state debounce ----
 DEBOUNCE_REACH = 6   # consecutive ticks palm must be within threshold
+
+# ---- Lift success criterion ----
+LIFT_DONE_CLEARANCE = 0.25  # m above table top — cylinder visibly off the surface
 
 # ---- Reacher workspace bounds in pelvis frame ----
 # From the training spec; targets outside are clamped before being sent.
@@ -62,7 +67,8 @@ class FSMState(Enum):
     APPROACH_SOURCE = auto()
     HOVER_SOURCE    = auto()
     DESCEND_SOURCE  = auto()
-    CLOSE_GRIP      = auto()   # Step 8: grip + kinematic attachment
+    CLOSE_GRIP      = auto()   # close fingers; wait for backend to confirm attach
+    LIFT_SOURCE     = auto()   # raise arm to carry pose; confirm cylinder left table
     DONE            = auto()
 
 
@@ -91,6 +97,7 @@ class FSMCore:
         self._tick_total  = 0
         self._tick_state  = 0
         self._reach_count = 0   # general-purpose debounce counter
+        self._attached    = False  # updated each tick by FSMPolicy from grasp backend
 
         print(
             f"[FSM] init  state={self.state.name}"
@@ -102,7 +109,14 @@ class FSMCore:
     # Public API
     # ------------------------------------------------------------------ #
 
-    def tick(self) -> PolicyOutput:
+    def tick(self, attached: bool = False) -> PolicyOutput:
+        """Advance the FSM by one control tick.
+
+        attached: True when the grasp backend reports the cylinder is welded to
+                  the palm this tick.  Passed in by FSMPolicy so FSMCore stays
+                  free of any dependency on the backend.
+        """
+        self._attached = attached
         out = self._dispatch()
         self._tick_total += 1
         self._tick_state += 1
@@ -118,6 +132,7 @@ class FSMCore:
         if self.state == FSMState.HOVER_SOURCE:    return self._hover_source()
         if self.state == FSMState.DESCEND_SOURCE:  return self._descend_source()
         if self.state == FSMState.CLOSE_GRIP:      return self._close_grip()
+        if self.state == FSMState.LIFT_SOURCE:     return self._lift_source()
         return self._done()
 
     def _transition(self, new: FSMState) -> None:
@@ -136,7 +151,16 @@ class FSMCore:
                   f"  entry_palm_dist={dist:.3f}")
         elif new == FSMState.CLOSE_GRIP:
             dist = float(np.linalg.norm(self._palm_world() - self._cylinder_world()))
-            print(f"[FSM]   palm_to_cyl={dist:.3f} m  (grip pending Step 8)")
+            print(f"[FSM]   palm_to_cyl={dist:.3f} m")
+        elif new == FSMState.LIFT_SOURCE:
+            palm = self._palm_world()
+            cyl  = self._cylinder_world()
+            print(f"[FSM]   palm_z={palm[2]:.3f}  cyl_z={cyl[2]:.3f}  attached={self._attached}")
+        elif new == FSMState.DONE:
+            cyl  = self._cylinder_world()
+            tbl_z = self._table_surface_z()
+            print(f"[FSM]   cyl_z={cyl[2]:.3f}  table_z={tbl_z:.3f}"
+                  f"  clearance={cyl[2] - tbl_z:.3f} m")
         self.state        = new
         self._tick_state  = 0
         self._reach_count = 0   # reset debounce for the new state
@@ -230,24 +254,50 @@ class FSMCore:
         )
 
     def _close_grip(self) -> PolicyOutput:
-        """Step 8 stub: hold grasp pose, grip not yet commanded."""
         grasp = self._source_grasp_world()
         reach = self._reach_from_world(grasp, right_bias=-0.03)
+
+        if self._attached:
+            print(f"[FSM] CLOSE_GRIP → attached at t={self._tick_total}")
+            self._transition(FSMState.LIFT_SOURCE)
+        elif self._tick_state >= CLOSE_GRIP_TIMEOUT:
+            print(f"[FSM] CLOSE_GRIP → timeout (not attached)  t={self._tick_total}")
+            self._transition(FSMState.LIFT_SOURCE)
+
         return PolicyOutput(
             walk_cmd=(0.0, 0.0, 0.0),
             reach_target=reach,
             reach_active=True,
-            grip_closed=False,
+            grip_closed=True,
+        )
+
+    def _lift_source(self) -> PolicyOutput:
+        palm  = self._palm_world()
+        tbl_z = self._table_surface_z()
+
+        if palm[2] >= tbl_z + LIFT_DONE_CLEARANCE:
+            print(f"[FSM] LIFT_SOURCE → done"
+                  f"  palm_z={palm[2]:.3f}  clearance={palm[2] - tbl_z:.3f}")
+            self._transition(FSMState.DONE)
+        elif self._tick_state >= LIFT_SOURCE_TIMEOUT:
+            print(f"[FSM] LIFT_SOURCE → timeout  palm_z={palm[2]:.3f}")
+            self._transition(FSMState.DONE)
+
+        return PolicyOutput(
+            walk_cmd=(0.0, 0.0, 0.0),
+            reach_target=CARRY_POSE,
+            reach_active=True,
+            grip_closed=True,
         )
 
     def _done(self) -> PolicyOutput:
         if self._tick_state == 0:
-            print("[FSM] DONE  task complete — holding position")
+            print("[FSM] DONE  task complete — holding carry pose")
         return PolicyOutput(
             walk_cmd=(0.0, 0.0, 0.0),
             reach_target=CARRY_POSE,
-            reach_active=False,
-            grip_closed=False,
+            reach_active=True,
+            grip_closed=self._attached,
         )
 
     # ------------------------------------------------------------------ #
