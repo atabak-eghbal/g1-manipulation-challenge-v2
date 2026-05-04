@@ -40,8 +40,9 @@ class KinematicAttachment(GraspBackend):
     destabilising the robot.
     """
 
-    ATTACH_DIST: float = 0.13  # m: auto-attach when palm is within this distance
-    SNAP_DIST:   float = 0.03  # m: clamp palm-local offset so object sits in hand
+    ATTACH_DIST:   float = 0.13  # m: auto-attach when palm is within this distance
+    SNAP_DIST:     float = 0.03  # m: clamp palm-local offset so object sits in hand
+    RELEASE_TICKS: int   = 15    # physics ticks (~0.075s) to wait before restoring geoms
 
     def __init__(
         self,
@@ -69,6 +70,7 @@ class KinematicAttachment(GraspBackend):
         self._orig_conaffinity = {g: int(model.geom_conaffinity[g]) for g in self._geom_ids}
 
         self._is_attached    = False
+        self._release_timer  = 0
         self._local_offset   = np.zeros(3, dtype=np.float64)
 
     # ------------------------------------------------------------------ #
@@ -81,6 +83,10 @@ class KinematicAttachment(GraspBackend):
 
     def tick(self, grip_closed: bool) -> bool:
         if not self._is_attached:
+            if self._release_timer > 0:
+                self._release_timer -= 1
+                if self._release_timer == 0:
+                    self._restore_geoms()
             if grip_closed:
                 palm = self._data.site_xpos[self._palm_id].copy()
                 obj  = self._data.xpos[self._obj_id].copy()
@@ -114,6 +120,7 @@ class KinematicAttachment(GraspBackend):
             self._model.geom_conaffinity[g] = 0
 
         self._is_attached = True
+        self._release_timer = 0
         snap = float(np.linalg.norm(self._local_offset))
         print(f"[GRASP] attached  dist={float(np.linalg.norm(palm_pos - obj_pos)):.3f} m"
               f"  snap_offset={snap:.3f} m")
@@ -128,9 +135,13 @@ class KinematicAttachment(GraspBackend):
         self._data.qvel[self._qveladr    :self._qveladr + 6] = 0.0
 
     def _release(self) -> None:
+        self._data.qvel[self._qveladr:self._qveladr + 6] = 0.0
+        self._is_attached = False
+        self._release_timer = self.RELEASE_TICKS
+        print(f"[GRASP] released — waiting {self.RELEASE_TICKS} ticks to restore geoms")
+
+    def _restore_geoms(self) -> None:
         for g in self._geom_ids:
             self._model.geom_contype[g]     = self._orig_contype[g]
             self._model.geom_conaffinity[g] = self._orig_conaffinity[g]
-        self._data.qvel[self._qveladr:self._qveladr + 6] = 0.0
-        self._is_attached = False
-        print("[GRASP] released")
+        print("[GRASP] geoms restored")

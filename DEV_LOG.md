@@ -665,5 +665,19 @@ The standing waypoint `(−0.300, −0.600 + 0.34) = (−0.300, −0.260)` is wh
 
 Added `if self._tbl_white_id >= 0:` guard before the body-centre fallback, and return `False` when both IDs are −1. Previously, `xpos[-1]` (Python negative indexing into the MuJoCo array) could read an arbitrary body position when `tbl_white_id = −1`.
 
-- **Files Changed:** `policies/fsm_core.py`.
-- **Pass / Fail:** Pending re-run after fix.
+## [2026-05-04] Step 11: Fix Instability at Release and Improve Target Approach
+
+- **Goal:** Resolve simulation crashes (NaNs) during cylinder release and improve placement accuracy on the target table.
+- **Files Changed:** `common/grasp.py`, `policies/fsm_core.py`.
+- **Findings:**
+    1. **Instability Root Cause:** Restoring cylinder collisions immediately after opening the grip caused huge contact impulses (NaN/Inf in QACC) because the fingers had not yet physically opened enough to clear the cylinder geoms.
+    2. **Target Approach Issue:** The robot was approaching the target table such that the drop point was to its left, forcing the right arm to reach across the chest, leading to overextension and instability.
+- **Fixes:**
+    1. **Delayed Release:** Added `RELEASE_TICKS = 15` to `KinematicAttachment`. Collisions are now restored 0.075s after the kinematic weld is broken, giving fingers time to open but preventing the cylinder from falling through the table.
+    2. **Sweet-Spot Offset:** Offset the target approach waypoint by `+0.15m` in world X (robot's right when facing -y) to keep the drop point in the right arm's natural workspace.
+    3. **Tightened Tolerances:** Reduced `TARGET_APPROACH_DIST_THRESH` and `PHASE1_ALIGN_TOL` to ensure better alignment before starting the arm motion.
+- **Result:**
+    - Simulation is stable throughout release and retraction.
+    - Cylinder consistently lands on the blue target table (`on_target_table=True`).
+    - Task completes through `DONE` state in ~50 simulated seconds.
+- **Status:** **Pass.**

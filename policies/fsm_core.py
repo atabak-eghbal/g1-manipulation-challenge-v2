@@ -57,7 +57,7 @@ LIFT_DONE_CLEARANCE = 0.25  # m above table top — cylinder visibly off the sur
 # Near edge = table_white geom_center_y + half_size_y (less-negative y = robot side).
 TARGET_NEAR_EDGE_INSET  = 0.05   # m inward from near edge
 TARGET_REACH_DEBOUNCE   = 8      # consecutive in-window ticks → HOVER_TARGET
-TARGET_APPROACH_TIMEOUT = 900    # ~18 s fallback (large turn required from source side)
+TARGET_APPROACH_TIMEOUT = 1200    # ~24 s fallback (increased from 900)
 
 # ---- Target table placement ----
 HOVER_TARGET_HEIGHT    = 0.18   # m above target surface for pre-place hover
@@ -79,12 +79,12 @@ ON_TABLE_Z_MAX     = 0.20   # m above surface: cap for height sanity check
 # turning circle: R = VX_P1 / WZ_P1 ≈ 0.12 m — small enough to land in the reach window.
 VX_P1 = 0.12   # m/s: minimum effective forward speed for the walker
 WZ_P1 = 1.0    # rad/s: full angular rate so the robot actually turns
-PHASE1_ALIGN_TOL = 0.40   # rad: exit Phase 1 when |yaw − (−π/2)| < this
+PHASE1_ALIGN_TOL = 0.15   # rad: exit Phase 1 when |yaw − (−π/2)| < this
 
 # World-frame proximity to the standing waypoint required before HOVER_TARGET.
 # Replaces the pelvis-frame reach-window check, which fires too early mid-turn
 # (the drop point can project into the window at wrong orientations).
-TARGET_APPROACH_DIST_THRESH = 0.20   # m: pelvis must be within this of the waypoint
+TARGET_APPROACH_DIST_THRESH = 0.08   # m: pelvis must be within this of the waypoint
 
 # ---- Reacher workspace bounds in pelvis frame ----
 # From the training spec; targets outside are clamped before being sent.
@@ -692,17 +692,16 @@ class FSMCore:
             return (VX_P1, 0.0, -WZ_P1)
 
         # ---- Phase 2: drive toward standing waypoint -------------------------
-        # Standing waypoint: APPROACH_TARGET_X m toward robot from the drop point.
+        # Standing waypoint: offset from drop point to keep it in the right arm's
+        # natural workspace (y ≈ -0.15 in pelvis frame).
+        # Facing -y world, +y pelvis is +x world.  So we want pelvis_x = drop_x + 0.15.
         drop_w  = self._target_drop_pt
-        stand_x = float(drop_w[0])
-        stand_y = float(drop_w[1]) + APPROACH_TARGET_X   # e.g. -0.60 + 0.34 = -0.26
+        stand_x = float(drop_w[0]) + 0.15
+        stand_y = float(drop_w[1]) + APPROACH_TARGET_X
 
         ex = stand_x - float(pelvis_pos[0])
         ey = stand_y - float(pelvis_pos[1])
         dist = float(np.sqrt(ex * ex + ey * ey))
-
-        bearing  = float(np.arctan2(ey, ex))
-        a_err    = (bearing - yaw + np.pi) % (2.0 * np.pi) - np.pi
 
         cos_y, sin_y = float(np.cos(yaw)), float(np.sin(yaw))
         left_err = -ex * sin_y + ey * cos_y
@@ -710,8 +709,15 @@ class FSMCore:
         if dist > 0.35:   vx = VX_FAST
         elif dist > 0.18: vx = VX_MED
         else:             vx = VX_SLOW
+
         vy = float(np.clip(K_VY * left_err, -VY_CAP, VY_CAP))
-        wz = float(np.clip(K_WZ * a_err,   -WZ_CAP, WZ_CAP))
+
+        # Use pelvis-frame bearing to the drop point for stable yaw control.
+        drop_p = self._target_drop_in_pelvis()
+        wz = float(np.clip(
+            K_WZ * np.arctan2(drop_p[1], max(drop_p[0], 0.15)),
+            -WZ_CAP, WZ_CAP,
+        ))
         return (vx, vy, wz)
 
     def _near_target_waypoint(self) -> bool:
@@ -723,15 +729,15 @@ class FSMCore:
         requires both conditions simultaneously.
         """
         yaw = self._pelvis_yaw()
-        if abs(yaw + np.pi / 2) > PHASE1_ALIGN_TOL:
+        if abs(yaw + np.pi / 2) > 0.10:
             return False
         pelvis = self._data.qpos[:3]
         drop_w = self._target_drop_pt
-        stand_x = float(drop_w[0])
+        stand_x = float(drop_w[0]) + 0.15
         stand_y = float(drop_w[1]) + APPROACH_TARGET_X
         ex = stand_x - float(pelvis[0])
         ey = stand_y - float(pelvis[1])
-        return float(np.sqrt(ex * ex + ey * ey)) < TARGET_APPROACH_DIST_THRESH
+        return float(np.sqrt(ex * ex + ey * ey)) < 0.06
 
     def _in_reach_window(self, cyl: np.ndarray) -> bool:
         return (REACH_X_MIN < cyl[0] < REACH_X_MAX and
